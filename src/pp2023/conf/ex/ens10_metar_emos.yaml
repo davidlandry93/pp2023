@@ -1,0 +1,14 @@
+defaults:
+- dataset: ens10_metar_steps_station_subset
+- nwp: ens10
+- model: emos
+- optimizer: adam
+- scheduler: reduce_lr_plateau
+- _self_
+
+batch_size: 64
+max_epochs: 100
+log_every_n_steps: 1
+
+optimizer:
+  lr: 5e-4

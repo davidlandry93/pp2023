@@ -1,0 +1,14 @@
+defaults:
+- ex: ens10_metar_emos
+- logging: default
+
+hydra:
+  run:
+    dir: ${oc.env:PP2023_RUN_DIR,"."}/run/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${oc.env:PP2023_RUN_DIR,"."}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: True
+
+
+num_workers: ${oc.decode:${oc.env:SLURM_CPUS_PER_TASK,4}}

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pp2023"
+version = "20230628"
+dependencies = [
+    "hydra-core",
+    "torch",
+    "pytorch_lightning",
+]
+
+[project.optional-dependencies]
+dev = ["isort", "black", "nb-clean"]
+eddie = ["eddie"]
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[project.scripts]
+pp2023_train = "pp2023.cli:train_cli"
+
+[tools.setuptools.package-data]
+"*" = ["*.yaml"]
