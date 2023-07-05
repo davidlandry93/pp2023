@@ -1,6 +1,7 @@
 defaults:
 - ex: ens10_metar_emos
 - logging: default
+- _self_
 
 hydra:
   run:

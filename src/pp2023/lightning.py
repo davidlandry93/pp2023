@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.distributions as td
 
-from .model.distribution import DistributionalForecast
+from .distribution import DistributionalForecast
 
 
 class PP2023Module(pl.LightningModule):
@@ -27,6 +27,9 @@ class PP2023Module(pl.LightningModule):
         self.scheduler = scheduler
         self.scheduler_interval = scheduler_interval
 
+        self.min_crps = float("inf")
+        self.validation_step_outputs = []
+
     def forward(self, batch):
         new_batch = {}
         for k in batch:
@@ -37,98 +40,125 @@ class PP2023Module(pl.LightningModule):
 
         return self.model(new_batch)
 
-    def training_step(self, batch):
+    def make_missing_obs_mask(self, batch):
+        target = batch["target"]
+        mask = ~(torch.isnan(target).any(dim=-1))
+        return mask
+
+    def make_prediction(self, batch, mask):
         nwp_base = self.distribution_strat.nwp_base(batch)
         correction = self.forward(batch)
         prediction = nwp_base + correction
 
-        target = batch["target"]
-        mask = ~(torch.isnan(target).any(dim=-1))
-
-        masked_target = target[mask]
         masked_prediction = prediction[mask]
+        predicted_distribution = self.distribution_strat.from_tensor(masked_prediction)
+        return predicted_distribution
 
-        predicted_distribution = self.distribution_strat(masked_prediction)
-
-        log_prob_loss = -predicted_distribution.log_prob(masked_target)
-        mean_log_prob_loss = log_prob_loss.mean()
+    def compute_loss(
+        self,
+        predicted_distribution,
+        target,
+        log_step=False,
+        log_epoch=True,
+        logging_prefix="Train",
+    ):
+        loss = predicted_distribution.loss(target)
+        mean_loss = loss.mean()
         self.log(
-            "Train/Loss/All",
-            mean_log_prob_loss,
-            on_step=True,
-            on_epoch=True,
+            f"{logging_prefix}/Loss/All",
+            mean_loss,
+            on_step=log_step,
+            on_epoch=log_epoch,
             prog_bar=True,
         )
 
-        crpss = predicted_distribution.crps(masked_target)
-        self.log("Train/CRPS/All", crpss.mean(), on_epoch=True, prog_bar=True)
-        self.log("Train/CRPS/t2m", crpss[..., 0].mean(), on_epoch=True, on_step=False)
-        self.log("Train/CRPS/si10", crpss[..., 1].mean(), on_epoch=True, on_step=False)
-
         self.log(
-            "Train/Loss/t2m",
-            log_prob_loss[..., 0].mean(),
-            on_epoch=True,
-            on_step=False,
+            f"{logging_prefix}/Loss/t2m",
+            loss[..., 0].mean(),
+            on_step=log_step,
+            on_epoch=log_epoch,
         )
         self.log(
-            "Train/Loss/si10",
-            log_prob_loss[..., 1].mean(),
-            on_epoch=True,
-            on_step=False,
+            f"{logging_prefix}/Loss/si10",
+            loss[..., 1].mean(),
+            on_step=log_step,
+            on_epoch=log_epoch,
         )
 
-        return mean_log_prob_loss
+        return mean_loss
+
+    def log_crps(
+        self,
+        predicted_distribution,
+        target,
+        log_step=False,
+        log_epoch=True,
+        prefix="Train",
+    ):
+        crpss = predicted_distribution.crps(target)
+        self.log(f"{prefix}/CRPS/All", crpss.mean(), on_epoch=log_epoch, prog_bar=True)
+        self.log(
+            f"{prefix}/CRPS/t2m",
+            crpss[..., 0].mean(),
+            on_epoch=log_epoch,
+            on_step=log_step,
+        )
+        self.log(
+            f"{prefix}/CRPS/si10",
+            crpss[..., 1].mean(),
+            on_epoch=log_epoch,
+            on_step=log_step,
+        )
+
+        return crpss.mean()
+
+    def training_step(self, batch):
+        mask = self.make_missing_obs_mask(batch)
+        masked_target = batch["target"][mask]
+        predicted_distribution = self.make_prediction(batch, mask)
+
+        loss = self.compute_loss(predicted_distribution, masked_target, log_step=True)
+
+        self.log_crps(predicted_distribution, masked_target)
+
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        breakpoint()
-        nwp_base = self.distribution_strat.nwp_base(batch)
-        correction = self.forward(batch)
-        prediction = nwp_base + correction
+        mask = self.make_missing_obs_mask(batch)
+        masked_target = batch["target"][mask]
+        predicted_distribution = self.make_prediction(batch, mask)
 
-        target = batch["target"]
-        mask = ~(torch.isnan(target).any(dim=-1))
-
-        masked_target = target[mask]
-        masked_prediction = prediction[mask]
-
-        predicted_distribution = self.distribution_strat.from_features(
-            masked_prediction
+        loss = self.compute_loss(
+            predicted_distribution, masked_target, logging_prefix="Val"
         )
 
-        log_prob_loss = -predicted_distribution.log_prob(masked_target)
-        mean_log_prob_loss = log_prob_loss.mean()
-        self.log(
-            "Val/Loss/All",
-            mean_log_prob_loss,
-            on_epoch=True,
-            prog_bar=True,
-            on_step=False,
+        crps = self.log_crps(predicted_distribution, masked_target, prefix="Val")
+
+        self.validation_step_outputs.append(
+            {
+                "loss": loss,
+                "crps": crps.mean().detach(),
+                "count": mask.sum().detach(),
+            }
         )
 
-        self.log(
-            "Val/Loss/t2m",
-            log_prob_loss[..., 0].mean(),
-            on_epoch=True,
-            prog_bar=True,
-            on_step=False,
-        )
-        self.log(
-            "Val/Loss/si10",
-            log_prob_loss[..., 1].mean(),
-            on_epoch=True,
-            prog_bar=True,
-            on_step=False,
-        )
+    def on_train_epoch_end(self) -> None:
+        sum_counts = 0
+        sum_crps = 0
 
-        crpss = predicted_distribution.crps(masked_target)
-        self.log(
-            "Val/CRPS/All", crpss.mean(), on_epoch=True, prog_bar=True, on_step=False
-        )
-        self.log("Val/CRPS/t2m", crpss[..., 0].mean(), on_epoch=True, on_step=False)
-        self.log("Val/CRPS/si10", crpss[..., 1].mean(), on_epoch=True, on_step=False)
+        for r in self.validation_step_outputs:
+            count = r["count"]
+            sum_crps += count * r["crps"]
+            sum_counts += count
 
-        return mean_log_prob_loss
+        crps_epoch = sum_crps / sum_counts
+
+        if (crps_epoch < self.min_crps).item():
+            self.log("min_crps", crps_epoch)
+            self.min_crps = crps_epoch
+            print("MIN CRPS", self.min_crps)
+
+        self.validation_step_outputs = []
 
     def on_test_epoch_end(self) -> None:
         test_loss = self.test_loss.compute()

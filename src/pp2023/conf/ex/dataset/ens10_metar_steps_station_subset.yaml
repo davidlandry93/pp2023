@@ -2,7 +2,8 @@ n_steps: 3
 n_stations: 8
 n_members: 10
 n_features: 88
+station_subset: tiny_stations
 maker:
   _target_: pp2023.dataset.make_torch_record_step_datasets
-  input_dir: ${oc.env:EDDIE_LOCAL_STORE}/ens10_metar/tiny_stations/sets/
+  input_dir: ${oc.env:EDDIE_LOCAL_STORE}/ens10_metar/${..station_subset}/sets/
   limit_features: ${..n_features}

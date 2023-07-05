@@ -16,3 +16,6 @@ early_stopping_patience: 50
 
 optimizer:
   lr: 1e-3
+
+dataset:
+  n_features: 8
