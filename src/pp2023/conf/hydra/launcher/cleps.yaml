@@ -1,0 +1,13 @@
+defaults: 
+- submitit_slurm
+
+timeout_min: ${ex.timeout_min}
+cpus_per_task: ${oc.select:ex.cpus_per_task,16}
+tasks_per_node: 1
+nodes: 1
+mem_gb: 32
+array_parallelism: 12
+# gres: gpu:1
+setup:
+  - source ${oc.env:HOME}/.bashrc
+  - conda activate eddie

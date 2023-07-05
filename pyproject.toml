@@ -7,6 +7,7 @@ name = "pp2023"
 version = "20230628"
 dependencies = [
     "hydra-core",
+    "nc-time-axis",
     "torch",
     "pytorch_lightning",
 ]
@@ -20,7 +21,14 @@ line-length = 88
 target-version = ['py311']
 
 [project.scripts]
-pp2023_train = "pp2023.cli:train_cli"
+pp2023_train = "pp2023.cli.train:train_cli"
+pp2023_predict = "pp2023.cli.predict:predict_cli"
 
 [tools.setuptools.package-data]
 "*" = ["*.yaml"]
+
+[project.entry-points.aqueduct_modules]
+pp2023 = "pp2023.aqueduct.extension:task_modules"
+
+[project.entry-points.aqueduct_config]
+pp2023 = "pp2023.aqueduct.extension:aq_config"

@@ -1,0 +1,4 @@
+n_parameters: 2  # For every forecast, we need 4 parameters to initialize our distributions.
+strategy:
+  _target_: pp2023.model.distribution.NormalParametricStrategy
+  n_variables: 2

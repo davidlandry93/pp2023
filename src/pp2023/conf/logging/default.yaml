@@ -1,4 +1,6 @@
 mlflow:
   experiment_name: PP2023_20230629
   run_name: "${hydra:runtime.choices.ex}"
-  tracking_uri: /home/dlandry/scratch/mlflow/store
+  tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,/home/dlandry/scratch/mlflow/store}
+  model_name: "${hydra:runtime.choices.ex}"
+  save_model: true

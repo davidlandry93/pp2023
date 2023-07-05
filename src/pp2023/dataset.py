@@ -120,16 +120,17 @@ class TorchIterStepDataset(AbstractIterStepDataset):
         self, example: dict[str, torch.Tensor], step: int
     ) -> dict[str, torch.Tensor]:
         to_return = {"step_idx": torch.from_numpy(np.array(step))}
-        for k in [
-            "features",
-            "target",
-            "forecast_parameters",
-            "deterministic_forecast",
-        ]:
-            to_return[k] = example[k][step, ...]
 
-        for k in ["month", "day_of_year"]:
-            to_return[k] = example[k]
+        for k in example:
+            if k in [
+                "features",
+                "target",
+                "forecast_parameters",
+                "deterministic_forecast",
+            ]:
+                to_return[k] = example[k][step, ...]
+            else:
+                to_return[k] = example[k]
 
         return to_return
 

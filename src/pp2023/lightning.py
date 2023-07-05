@@ -1,36 +1,28 @@
+from typing import Callable
+
 import math
 import omegaconf as oc
 import pandas as pd
 import pytorch_lightning as pl
 import torch
+import torch.nn as nn
 import torch.distributions as td
 
-SQRT_PI = math.sqrt(math.pi)
-
-
-def crps_normal(dist: torch.distributions.Normal, sample: torch.Tensor):
-    """See http://cran.nexr.com/web/packages/scoringRules/vignettes/crpsformulas.html#Normal."""
-    mean = dist.loc
-    std = dist.scale
-    centered_dist = torch.distributions.Normal(
-        torch.zeros_like(mean), scale=torch.ones_like(std)
-    )
-
-    centered_sample = (sample - mean) / std
-
-    cdf = centered_dist.cdf(centered_sample)
-    pdf = torch.exp(centered_dist.log_prob(centered_sample))
-
-    centered_crps = centered_sample * (2 * cdf - 1) + 2 * pdf - (1 / SQRT_PI)
-    crps = std * centered_crps
-
-    return crps
+from .model.distribution import DistributionalForecast
 
 
 class PP2023Module(pl.LightningModule):
-    def __init__(self, model, optimizer, scheduler, scheduler_interval="epoch"):
+    def __init__(
+        self,
+        model: nn.Module,
+        distribution_strategy: Callable[[torch.Tensor], DistributionalForecast],
+        optimizer,
+        scheduler,
+        scheduler_interval="epoch",
+    ):
         super().__init__()
         self.model = model
+        self.distribution_strat = distribution_strategy
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.scheduler_interval = scheduler_interval
@@ -46,7 +38,9 @@ class PP2023Module(pl.LightningModule):
         return self.model(new_batch)
 
     def training_step(self, batch):
-        prediction = self.forward(batch)
+        nwp_base = self.distribution_strat.nwp_base(batch)
+        correction = self.forward(batch)
+        prediction = nwp_base + correction
 
         target = batch["target"]
         mask = ~(torch.isnan(target).any(dim=-1))
@@ -54,9 +48,7 @@ class PP2023Module(pl.LightningModule):
         masked_target = target[mask]
         masked_prediction = prediction[mask]
 
-        predicted_distribution = td.Normal(
-            masked_prediction[..., 0], masked_prediction[..., 1]
-        )
+        predicted_distribution = self.distribution_strat(masked_prediction)
 
         log_prob_loss = -predicted_distribution.log_prob(masked_target)
         mean_log_prob_loss = log_prob_loss.mean()
@@ -68,7 +60,7 @@ class PP2023Module(pl.LightningModule):
             prog_bar=True,
         )
 
-        crpss = crps_normal(predicted_distribution, masked_target)
+        crpss = predicted_distribution.crps(masked_target)
         self.log("Train/CRPS/All", crpss.mean(), on_epoch=True, prog_bar=True)
         self.log("Train/CRPS/t2m", crpss[..., 0].mean(), on_epoch=True, on_step=False)
         self.log("Train/CRPS/si10", crpss[..., 1].mean(), on_epoch=True, on_step=False)
@@ -89,7 +81,10 @@ class PP2023Module(pl.LightningModule):
         return mean_log_prob_loss
 
     def validation_step(self, batch, batch_idx):
-        prediction = self.forward(batch)
+        breakpoint()
+        nwp_base = self.distribution_strat.nwp_base(batch)
+        correction = self.forward(batch)
+        prediction = nwp_base + correction
 
         target = batch["target"]
         mask = ~(torch.isnan(target).any(dim=-1))
@@ -97,8 +92,8 @@ class PP2023Module(pl.LightningModule):
         masked_target = target[mask]
         masked_prediction = prediction[mask]
 
-        predicted_distribution = td.Normal(
-            masked_prediction[..., 0], masked_prediction[..., 1]
+        predicted_distribution = self.distribution_strat.from_features(
+            masked_prediction
         )
 
         log_prob_loss = -predicted_distribution.log_prob(masked_target)
@@ -126,7 +121,7 @@ class PP2023Module(pl.LightningModule):
             on_step=False,
         )
 
-        crpss = crps_normal(predicted_distribution, masked_target)
+        crpss = predicted_distribution.crps(masked_target)
         self.log(
             "Val/CRPS/All", crpss.mean(), on_epoch=True, prog_bar=True, on_step=False
         )

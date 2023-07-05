@@ -1,0 +1,9 @@
+aqueduct:
+  local_store: ${oc.env:EDDIE_LOCAL_STORE, ./}
+pp2023:
+  aqueduct:
+    tasks:
+      ModelPredictions:
+        station_set: tiny_stations.csv
+        model_name:
+        run_id:

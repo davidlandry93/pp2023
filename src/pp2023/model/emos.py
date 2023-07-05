@@ -13,9 +13,9 @@ class EMOS(nn.Module):
     def __init__(
         self,
         in_features=4,
-        out_features=2,
-        out_params=2,
-        n_stations=None,
+        n_variables=2,
+        n_parameters=2,
+        n_stations=0,
         n_steps=3,
         n_time_models=1,
         n_step_models=1,
@@ -30,8 +30,8 @@ class EMOS(nn.Module):
                 n_step_models,
                 n_stations,
                 in_features,
-                out_features,
-                out_params,
+                n_variables,
+                n_parameters,
             )
         )
 
@@ -39,36 +39,23 @@ class EMOS(nn.Module):
 
         self.biases = nn.Parameter(
             torch.zeros(
-                n_time_models, n_step_models, n_stations, out_features, out_params
+                n_time_models,
+                n_step_models,
+                n_stations,
+                n_variables,
+                n_parameters,
             )
         )
 
     def forward(self, batch):
         time_group_id = (batch["day_of_year"] // self.time_model_span).long()
         step_group_id = (batch["step_idx"] // self.step_model_span).long()
-        epsilon = 1e-6
-
-        forecast_params = batch["forecast_parameters"]
-        forecast_mu = forecast_params[..., 0]
-        forecast_sigma = forecast_params[..., 1]
-        log_forecast_sigma = torch.log(forecast_sigma + epsilon)
-
-        processed_forecast_params = torch.stack(
-            [forecast_mu, log_forecast_sigma], dim=-1
-        )
 
         features = batch["features"][:, 0]  # remove members for now
         features = features.unsqueeze(-1).unsqueeze(-1)
         coefs = self.coefs[time_group_id, step_group_id]
         biases = self.biases[time_group_id, step_group_id]
 
-        prediction = processed_forecast_params + biases + (coefs * features).sum(dim=-3)
-
-        mu_parameter = prediction[..., 0]
-        log_sigma_parameter = prediction[..., 1]
-
-        prediction = torch.stack(
-            [mu_parameter, torch.exp(log_sigma_parameter) - epsilon], dim=-1
-        )
+        prediction = biases + (coefs * features).sum(dim=-3)
 
         return prediction
