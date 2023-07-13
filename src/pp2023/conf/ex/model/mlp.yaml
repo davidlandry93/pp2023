@@ -1,0 +1,3 @@
+_target_: pp2023.model.mlp.MLP
+embedding_size: 32
+n_blocks: 4

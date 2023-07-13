@@ -124,6 +124,7 @@ class TorchIterStepDataset(AbstractIterStepDataset):
         for k in example:
             if k in [
                 "features",
+                "time_features",
                 "target",
                 "forecast",
                 "forecast_sort_idx",
