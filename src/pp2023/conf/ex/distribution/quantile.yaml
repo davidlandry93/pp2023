@@ -1,0 +1,4 @@
+n_parameters: 10  # For every forecast, we need 4 parameters to initialize our distributions.
+strategy:
+  _target_: pp2023.distribution.QuantileRegressionStrategy
+  n_quantiles: ${..n_parameters}

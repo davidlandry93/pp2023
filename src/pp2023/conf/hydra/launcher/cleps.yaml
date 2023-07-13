@@ -8,6 +8,7 @@ nodes: 1
 mem_gb: 32
 array_parallelism: 12
 # gres: gpu:1
+partition: cpu_homogen
 setup:
   - source ${oc.env:HOME}/.bashrc
   - conda activate eddie

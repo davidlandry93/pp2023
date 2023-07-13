@@ -48,6 +48,7 @@ class PP2023Module(pl.LightningModule):
     def make_prediction(self, batch, mask):
         nwp_base = self.distribution_strat.nwp_base(batch)
         correction = self.forward(batch)
+
         prediction = nwp_base + correction
 
         masked_prediction = prediction[mask]
@@ -156,7 +157,6 @@ class PP2023Module(pl.LightningModule):
         if (crps_epoch < self.min_crps).item():
             self.log("min_crps", crps_epoch)
             self.min_crps = crps_epoch
-            print("MIN CRPS", self.min_crps)
 
         self.validation_step_outputs = []
 

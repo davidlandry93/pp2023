@@ -18,6 +18,8 @@ from ..lightning import PP2023Module, LogHyperparametersCallback
 
 @hydra.main(config_path="../conf", config_name="train", version_base="1.3")
 def train_cli(cfg):
+    steps_per_epoch = cfg.ex.dataset.train_size // cfg.ex.batch_size
+
     mlflow.set_tracking_uri(cfg.logging.mlflow.tracking_uri)
     mlflow_client = mlflow.MlflowClient()
     experiments = mlflow_client.search_experiments()
@@ -43,8 +45,16 @@ def train_cli(cfg):
     model = build_model_from_config(cfg)
     distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
     optimizer = hydra.utils.instantiate(cfg.ex.optimizer, model.parameters())
-    scheduler = hydra.utils.instantiate(cfg.ex.scheduler, optimizer)
-    lightning_module = PP2023Module(model, distribution_strat, optimizer, scheduler)
+    scheduler = hydra.utils.instantiate(
+        cfg.ex.scheduler.instance, optimizer, steps_per_epoch=steps_per_epoch
+    )
+    lightning_module = PP2023Module(
+        model,
+        distribution_strat,
+        optimizer,
+        scheduler,
+        scheduler_interval=cfg.ex.scheduler.interval,
+    )
 
     checkpoint_callback = ModelCheckpoint(
         monitor="Val/CRPS/All", auto_insert_metric_name=False

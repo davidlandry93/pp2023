@@ -125,6 +125,8 @@ class TorchIterStepDataset(AbstractIterStepDataset):
             if k in [
                 "features",
                 "target",
+                "forecast",
+                "forecast_sort_idx",
                 "forecast_parameters",
                 "deterministic_forecast",
             ]:
