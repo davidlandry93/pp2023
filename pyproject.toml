@@ -12,6 +12,8 @@ dependencies = [
     "pytorch_lightning",
 ]
 
+
+
 [project.optional-dependencies]
 dev = ["isort", "black", "nb-clean"]
 eddie = ["eddie"]

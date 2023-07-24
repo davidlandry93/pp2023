@@ -1,0 +1,6 @@
+# @package _global_
+
+ex:
+  dataset:
+    maker:
+      to_32bits: true

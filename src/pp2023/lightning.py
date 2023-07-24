@@ -34,7 +34,7 @@ class PP2023Module(pl.LightningModule):
         new_batch = {}
         for k in batch:
             if batch[k].dtype == torch.double:
-                new_batch[k] = batch[k].float()
+                new_batch[k] = batch[k].to(torch.float32)
             else:
                 new_batch[k] = batch[k]
 

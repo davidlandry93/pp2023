@@ -149,7 +149,7 @@ class DeterministicForecast(DistributionalForecast):
 
 
 class QuantileRegression(DistributionalForecast):
-    def __init__(self, params, regularization=1e-1):
+    def __init__(self, params, regularization=1e-5):
         self.parameters = params
         self.r = regularization
 
@@ -171,6 +171,7 @@ class QuantileRegression(DistributionalForecast):
         misalignments = self.r * torch.square(
             torch.clamp(self.parameters[..., 1:] - self.parameters[..., :-1], max=0)
         ).sum(dim=-1)
+
         return self.crps(x) + misalignments
 
     def auc(self, x: torch.Tensor):
@@ -187,8 +188,9 @@ class QuantileRegression(DistributionalForecast):
 
 
 class QuantileRegressionStrategy(DistributionalForecastStrategy):
-    def __init__(self, n_quantiles: int):
+    def __init__(self, n_quantiles: int, regularization: float = 1e-6):
         self.n_quantiles = n_quantiles
+        self.regularization = regularization
 
     def nwp_base(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         members_values = torch.gather(batch["forecast"], 1, batch["forecast_sort_idx"])
@@ -202,4 +204,4 @@ class QuantileRegressionStrategy(DistributionalForecastStrategy):
         return members_values[:, member_idx].transpose(1, 2).transpose(2, 3)
 
     def from_tensor(self, x: torch.Tensor) -> "QuantileRegression":
-        return QuantileRegression(x)
+        return QuantileRegression(x, regularization=self.regularization)

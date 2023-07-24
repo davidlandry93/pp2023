@@ -1,0 +1,16 @@
+# @package _global_
+
+# pre:
+#   dataset_to_scratch:
+#     - rsync
+#     - --progress
+#     - -r
+#     - ${oc.env:EDDIE_LOCAL_STORE}/ens10_metar/${ex.dataset.station_subset}/sets/
+#     - ${oc.env:EDDIE_SCRATCH_STORE}/ens10_metar/${ex.dataset.station_subset}/sets/
+
+ex:
+  dataset:
+    maker:
+      input_dir: ${oc.env:EDDIE_SCRATCH_STORE}/ens10_metar/${ex.dataset.station_subset}/sets/
+
+num_workers: 4

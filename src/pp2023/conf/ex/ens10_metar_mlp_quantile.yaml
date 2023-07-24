@@ -1,5 +1,5 @@
 defaults:
-- dataset: ens10_metar_steps_station_subset
+- dataset: pp2023_medium
 - nwp: ens10
 - model: mlp
 - distribution: quantile
@@ -7,15 +7,19 @@ defaults:
 - scheduler: one_cycle
 - _self_
 
-timeout_min: 60
+timeout_min: 240
 
 batch_size: 64
 max_epochs: 300
-log_every_n_steps: 1
-early_stopping_patience: 50
+log_every_n_steps: 20
+early_stopping_patience: 60
 
-optimizer:
-  lr: 1e-3
+# optimizer:
+#   lr: 1e-3
 
 dataset:
   n_features: 6
+
+scheduler:
+  instance:
+    max_lr: 5e-3

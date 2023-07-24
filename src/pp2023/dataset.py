@@ -14,10 +14,11 @@ class TorchRecordDataset:
     """Dataset where the examples are already transformed and saved as torch
     dictionaries."""
 
-    def __init__(self, input_dir, limit_features=None):
+    def __init__(self, input_dir, limit_features=None, to_32bits=False):
         self.input_dir = pathlib.Path(input_dir)
         self.files = list(self.input_dir.glob("*.pt"))
         self.limit_features = limit_features
+        self.to_32bits = to_32bits
 
     def __len__(self):
         return len(self.files)
@@ -27,6 +28,17 @@ class TorchRecordDataset:
 
         if self.limit_features is not None:
             example["features"] = example["features"][..., : self.limit_features]
+
+        if self.to_32bits:
+            new_example = {}
+            for k in example:
+                if example[k].dtype == torch.float64:
+                    new_example[k] = example[k].to(dtype=torch.float32)
+                else:
+                    new_example[k] = example[k]
+
+            example = new_example
+
         return example
 
 
@@ -109,8 +121,8 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
 
 
 class TorchIterStepDataset(AbstractIterStepDataset):
-    def __init__(self, path, **kwargs):
-        super().__init__(TorchRecordDataset(path, **kwargs))
+    def __init__(self, inner):
+        super().__init__(inner)
 
     def list_steps(self, example):
         unique_steps = list(range(example["target"].shape[0]))
@@ -138,19 +150,37 @@ class TorchIterStepDataset(AbstractIterStepDataset):
         return to_return
 
 
-def make_torch_record_datasets(input_dir):
-    input_path = pathlib.Path(input_dir)
-    return [
-        TorchRecordDataset(input_path / "train"),
-        TorchRecordDataset(input_path / "val"),
-        TorchRecordDataset(input_path / "test"),
-    ]
+class CacheDataset:
+    def __init__(self, inner_dataset):
+        self.inner = inner_dataset
+        self.cache = {}
+
+    def __getitem__(self, key):
+        if key not in self.cache:
+            self.cache[key] = self.inner[key]
+
+        return self.cache[key]
+
+    def __len__(self):
+        return len(self.inner)
 
 
-def make_torch_record_step_datasets(input_dir, **kwargs):
+def make_torch_record_datasets(input_dir, cache=False, **kwargs):
     input_path = pathlib.Path(input_dir)
-    return [
-        TorchIterStepDataset(input_path / "train", **kwargs),
-        TorchIterStepDataset(input_path / "val", **kwargs),
-        TorchIterStepDataset(input_path / "test", **kwargs),
+
+    datasets = [
+        TorchRecordDataset(input_path / "train", **kwargs),
+        TorchRecordDataset(input_path / "val", **kwargs),
+        TorchRecordDataset(input_path / "test", **kwargs),
     ]
+
+    if cache:
+        datasets = [CacheDataset(d) for d in datasets]
+
+    return datasets
+
+
+def make_torch_record_step_datasets(input_dir, cache=False, **kwargs):
+    inner_datasets = make_torch_record_datasets(input_dir, cache=cache, **kwargs)
+
+    return [TorchIterStepDataset(d) for d in inner_datasets]
