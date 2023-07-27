@@ -89,6 +89,7 @@ class TransformerModel(nn.Module):
     def __init__(
         self,
         in_features: int,
+        n_variables: int,
         n_parameters: int,
         n_heads=4,
         embedding_size=128,
@@ -98,8 +99,15 @@ class TransformerModel(nn.Module):
         n_stations=None,
         n_steps=None,
         n_time_models=12,
+        select_member="first",
     ):
         super().__init__()
+
+        self.n_variables = n_variables
+        self.n_parameters = n_parameters
+        self.select_member = select_member
+
+        out_features = n_variables * n_parameters
 
         self.add_meta_tokens = add_meta_tokens
 
@@ -124,19 +132,44 @@ class TransformerModel(nn.Module):
             ]
         )
 
-        self.regression = nn.Linear(embedding_size, n_parameters, bias=True)
+        self.regression = nn.Linear(embedding_size, out_features, bias=True)
 
     def forward(self, batch):
-        station_id = batch["station_id"]
-        features = batch["features"]
-        step_id = batch["step_id"]
-        forecast_time_id = batch["forecast_time_id"]
+        batch_size, n_members, n_stations, n_features = batch["features"].shape
+
+        embedded_features = self.embedding(batch["features"])
+
+        if self.select_member == "first":
+            selected_features = embedded_features[:, 0]
+        elif self.select_member == "random":
+            if self.train:
+                selected_features = embedded_features[
+                    torch.arange(0, batch_size),
+                    torch.randint(0, n_members, (batch_size,)),
+                ]
+            else:
+                selected_features = embedded_features[:, 0]
+
+        elif self.select_member == "mean":
+            selected_features = embedded_features.mean(dim=1)
+        elif self.select_member == "all":
+            selected_features = embedded_features.reshape(batch_size, -1, n_features)
+        else:
+            raise ValueError(f"Invalid selection strategy {self.select_member}")
+
+        step_id = batch["step_idx"]
         day_of_year = batch["day_of_year"]
+
+        repeat_member = n_members if self.select_member == "all" else 1
+        station_id = (
+            torch.arange(n_stations)
+            .repeat((batch_size, repeat_member, 1))
+            .reshape(batch_size, -1)
+        )
 
         station_embeddings = self.station_embedding[station_id]
 
-        embedded_features = self.embedding(features)
-        attention_in_features = embedded_features + station_embeddings
+        attention_in_features = selected_features + station_embeddings
 
         # Add tokens at the end of the sequence that describe the context (forecast id,
         # step id, etc).
@@ -144,14 +177,13 @@ class TransformerModel(nn.Module):
             day_of_year_token = self.day_of_year_embedding[
                 day_of_year // self.time_model_span
             ]
-            step_token = self.step_embedding[step_id[:, 0]]
+            step_token = self.step_embedding[step_id]
 
             attention_in_features = torch.cat(
                 [
                     attention_in_features,
                     day_of_year_token.unsqueeze(1),
                     step_token.unsqueeze(1),
-                    forecast_time_id.unsqueeze(1),
                 ],
                 dim=1,
             )
@@ -160,9 +192,19 @@ class TransformerModel(nn.Module):
 
         # Remove the metadata tokens if necessary.
         if self.add_meta_tokens:
-            n_meta_tokens = 4 if self.use_model_embedding else 3
+            n_meta_tokens = 2
             annotated_features = annotated_features[:, :-n_meta_tokens]
 
-        correction = self.regression(annotated_features)
+        if self.select_member == "all":
+            annotated_features_by_station = annotated_features.reshape(
+                batch_size, n_members, n_stations, -1
+            )
+            aggregated_features = annotated_features_by_station.mean(dim=1)
+        else:
+            aggregated_features = annotated_features
 
-        return correction.squeeze()
+        correction = self.regression(aggregated_features)
+
+        return correction.reshape(
+            *correction.shape[:-1], self.n_variables, self.n_parameters
+        )

@@ -5,10 +5,11 @@ timeout_min: ${ex.timeout_min}
 cpus_per_task: ${oc.select:ex.cpus_per_task,8}
 tasks_per_node: 1
 nodes: 1
-array_parallelism: 12
+# array_parallelism: 12
 gres: gpu:1
 partition: 
 account: ovm@v100
+constraint: ${ex.jz_constraint}
 setup:
   - source ${oc.env:HOME}/.bashrc
   - conda activate eddie

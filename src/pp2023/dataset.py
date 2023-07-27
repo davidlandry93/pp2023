@@ -14,9 +14,13 @@ class TorchRecordDataset:
     """Dataset where the examples are already transformed and saved as torch
     dictionaries."""
 
-    def __init__(self, input_dir, limit_features=None, to_32bits=False):
+    def __init__(self, input_dir, limit_features=None, to_32bits=False, shuffle=False):
         self.input_dir = pathlib.Path(input_dir)
         self.files = list(self.input_dir.glob("*.pt"))
+
+        if shuffle:
+            random.shuffle(self.files)
+
         self.limit_features = limit_features
         self.to_32bits = to_32bits
 
@@ -51,6 +55,7 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
         input_dataset: Any,
         transform=None,
         min_rows: int = None,
+        shuffle_inner: bool = False,
         shuffle_steps=False,
     ):
         """Args:
@@ -64,6 +69,7 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
         """
         self.input_dataset = input_dataset
         self.transform = transform
+        self.shuffle_inner = shuffle_inner
         self.shuffle_steps = shuffle_steps
         self.min_rows = min_rows
 
@@ -84,9 +90,11 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
 
             _logger.debug(f"Worker bounds: {iter_start} to {iter_end}")
 
-            input_dataset_it = (
-                self.input_dataset[i] for i in range(iter_start, iter_end)
-            )
+            inner_idx = list(range(iter_start, iter_end))
+            if self.shuffle_inner:
+                random.shuffle(inner_idx)
+
+            input_dataset_it = (self.input_dataset[i] for i in inner_idx)
 
         for example in input_dataset_it:
             unique_steps = self.list_steps(example)
@@ -121,8 +129,10 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
 
 
 class TorchIterStepDataset(AbstractIterStepDataset):
-    def __init__(self, inner):
-        super().__init__(inner)
+    def __init__(self, inner, shuffle_inner=False, shuffle_steps=False):
+        super().__init__(
+            inner, shuffle_inner=shuffle_inner, shuffle_steps=shuffle_steps
+        )
 
     def list_steps(self, example):
         unique_steps = list(range(example["target"].shape[0]))
@@ -131,8 +141,7 @@ class TorchIterStepDataset(AbstractIterStepDataset):
     def filter_example(
         self, example: dict[str, torch.Tensor], step: int
     ) -> dict[str, torch.Tensor]:
-        to_return = {"step_idx": torch.from_numpy(np.array(step))}
-
+        to_return = {}
         for k in example:
             if k in [
                 "features",
@@ -142,6 +151,7 @@ class TorchIterStepDataset(AbstractIterStepDataset):
                 "forecast_sort_idx",
                 "forecast_parameters",
                 "deterministic_forecast",
+                "step_idx",
             ]:
                 to_return[k] = example[k][step, ...]
             else:
@@ -169,7 +179,7 @@ def make_torch_record_datasets(input_dir, cache=False, **kwargs):
     input_path = pathlib.Path(input_dir)
 
     datasets = [
-        TorchRecordDataset(input_path / "train", **kwargs),
+        TorchRecordDataset(input_path / "train", shuffle=True, **kwargs),
         TorchRecordDataset(input_path / "val", **kwargs),
         TorchRecordDataset(input_path / "test", **kwargs),
     ]
@@ -181,6 +191,10 @@ def make_torch_record_datasets(input_dir, cache=False, **kwargs):
 
 
 def make_torch_record_step_datasets(input_dir, cache=False, **kwargs):
-    inner_datasets = make_torch_record_datasets(input_dir, cache=cache, **kwargs)
+    train, val, test = make_torch_record_datasets(input_dir, cache=cache, **kwargs)
 
-    return [TorchIterStepDataset(d) for d in inner_datasets]
+    return [
+        TorchIterStepDataset(train, shuffle_inner=True, shuffle_steps=True),
+        TorchIterStepDataset(val),
+        TorchIterStepDataset(test),
+    ]

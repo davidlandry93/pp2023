@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 @hydra.main(config_path="../conf", config_name="train", version_base="1.3")
 def train_cli(cfg):
+    logger.info(f"Working from: {os.getcwd()}")
     if "pre" in cfg and cfg["pre"] is not None:
         for k in cfg["pre"]:
             cmd = cfg["pre"][k]
@@ -33,8 +34,6 @@ def train_cli(cfg):
 
     if torch.backends.mps.is_available():
         torch.set_default_dtype(torch.float32)
-
-    steps_per_epoch = cfg.ex.dataset.train_size // cfg.ex.batch_size
 
     mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
     mlflow_client = mlflow.MlflowClient()
@@ -50,6 +49,7 @@ def train_cli(cfg):
     train_dataloader, val_dataloader, test_dataloader = build_dataloaders_from_config(
         cfg
     )
+    steps_per_epoch = len(list(train_dataloader))
 
     model = build_model_from_config(cfg)
     distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
@@ -64,14 +64,16 @@ def train_cli(cfg):
         scheduler,
         scheduler_interval=cfg.ex.scheduler.interval,
     )
-
-    checkpoint_callback = ModelCheckpoint(
-        monitor="Val/CRPS/All", auto_insert_metric_name=False
+    best_checkpoint_callback = ModelCheckpoint(
+        dirpath=os.getcwd(),
+        monitor="Val/CRPS/All",
+        auto_insert_metric_name=False,
+        save_last=True,
     )
     callbacks = [
         LogHyperparametersCallback(cfg.ex),
         LearningRateMonitor(),
-        checkpoint_callback,
+        best_checkpoint_callback,
         EarlyStopping(
             monitor="Val/CRPS/All",
             min_delta=1e-4,
@@ -79,11 +81,14 @@ def train_cli(cfg):
         ),
     ]
 
+    n_parameters = sum(p.numel() for p in model.parameters())
+
     tags = {
         "cwd": os.getcwd(),
         "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
         "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID", ""),
         "slurm_array_task_id": os.getenv("SLUM_ARRAY_TASK_ID", ""),
+        "n_parameters": n_parameters,
     }
 
     with mlflow.start_run(
@@ -91,9 +96,6 @@ def train_cli(cfg):
         tags=tags,
         run_name=cfg.mlflow.run_name,
     ) as mlflow_run:
-        os.symlink(".hydra", "hydra")
-        mlflow.log_artifact("hydra")
-
         mlflow_logger = pytorch_lightning.loggers.mlflow.MLFlowLogger(
             experiment_name=cfg.mlflow.experiment_name,
             tracking_uri=cfg.mlflow.tracking_uri,
@@ -114,12 +116,21 @@ def train_cli(cfg):
             val_dataloaders=val_dataloader,
         )
 
-        if checkpoint_callback.best_model_path:
-            os.symlink(checkpoint_callback.best_model_path, "best_checkpoint.ckpt")
-            mlflow.log_artifact("best_checkpoint.ckpt")
+        node_rank = os.getenv("NODE_RANK", None)
+        if not node_rank or node_rank == 0:
+            os.symlink(".hydra", "hydra")
+            mlflow.log_artifact("hydra")
 
-        if trainer.state.status == "finished" and cfg.mlflow.save_model:
-            if "model_name" in cfg.mlflow and cfg.mlflow.model_name:
-                mlflow.register_model(
-                    f"runs:/{mlflow_run.info.run_id}", cfg.logging.mlflow.model_name
+            if best_checkpoint_callback.best_model_path:
+                os.symlink(
+                    best_checkpoint_callback.best_model_path, "best_checkpoint.ckpt"
                 )
+                mlflow.log_artifact("best_checkpoint.ckpt")
+
+            if trainer.state.status == "finished" and cfg.mlflow.save_model:
+                if "model_name" in cfg.mlflow and cfg.mlflow.model_name:
+                    mlflow.register_model(
+                        f"runs:/{mlflow_run.info.run_id}", cfg.mlflow.model_name
+                    )
+
+            mlflow.log_artifact("last.ckpt")

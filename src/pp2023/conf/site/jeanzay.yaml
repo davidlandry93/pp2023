@@ -12,5 +12,3 @@ ex:
   dataset:
     maker:
       input_dir: ${oc.env:EDDIE_SCRATCH_STORE}/ens10_metar/${ex.dataset.station_subset}/sets/
-
-num_workers: 4

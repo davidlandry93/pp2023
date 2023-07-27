@@ -1,7 +1,7 @@
 defaults:
+- _self_
 - ex: ens10_metar_emos
 - mlflow: dev
-- _self_
 - optional site: ${oc.env:DL93_SITE,""}
 
 hydra:
@@ -16,3 +16,6 @@ hydra:
 num_workers: ${oc.decode:${oc.env:SLURM_CPUS_PER_TASK,4}}
 
 pre: # Dict of preprocessing external commands, empty for now.
+
+ex:
+  jz_constraint: 

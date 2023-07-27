@@ -1,0 +1,7 @@
+_target_: pp2023.model.transformer.TransformerModel
+embedding_size: 512
+n_blocks: 2
+n_heads: 16
+n_time_models: 12
+add_meta_tokens: True
+select_member: mean

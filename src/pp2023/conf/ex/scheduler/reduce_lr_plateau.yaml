@@ -1,6 +1,6 @@
 interval: epoch
 instance:
   _target_: pp2023.scheduler.reduce_lr_plateau
-  factor: 0.1
-  patience: 10
-  min_lr: 1e-7
+  factor: 0.2
+  patience: 50
+  min_lr: 1e-6
