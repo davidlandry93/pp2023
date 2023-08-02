@@ -9,6 +9,7 @@ nodes: 1
 gres: gpu:1
 partition: 
 account: ovm@v100
+qos: ${ex.qos}
 constraint: ${ex.jz_constraint}
 setup:
   - source ${oc.env:HOME}/.bashrc

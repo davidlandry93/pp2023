@@ -14,15 +14,24 @@ class TorchRecordDataset:
     """Dataset where the examples are already transformed and saved as torch
     dictionaries."""
 
-    def __init__(self, input_dir, limit_features=None, to_32bits=False, shuffle=False):
+    def __init__(
+        self,
+        input_dir,
+        limit_features=None,
+        to_32bits=False,
+        shuffle=False,
+    ):
         self.input_dir = pathlib.Path(input_dir)
         self.files = list(self.input_dir.glob("*.pt"))
 
         if shuffle:
             random.shuffle(self.files)
+        else:
+            self.files = sorted(self.files)
 
         self.limit_features = limit_features
         self.to_32bits = to_32bits
+        self.use_metadata_features = use_metadata_features
 
     def __len__(self):
         return len(self.files)
@@ -30,8 +39,12 @@ class TorchRecordDataset:
     def __getitem__(self, idx):
         example = torch.load(self.files[idx])
 
+        features = example["features"]
+
         if self.limit_features is not None:
-            example["features"] = example["features"][..., : self.limit_features]
+            features = features[..., : self.limit_features]
+
+        example["features"] = features
 
         if self.to_32bits:
             new_example = {}
@@ -145,7 +158,7 @@ class TorchIterStepDataset(AbstractIterStepDataset):
         for k in example:
             if k in [
                 "features",
-                "time_features",
+                "metadata_features",
                 "target",
                 "forecast",
                 "forecast_sort_idx",

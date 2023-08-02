@@ -1,0 +1,11 @@
+_target_: pp2023.model.linear.Linear
+n_time_models: 12
+share_member: True
+share_station: True
+share_step: True
+share_time: True
+embedding_member: False
+embedding_station: False
+embedding_step: False
+embedding_time: False
+use_metadata_features: True

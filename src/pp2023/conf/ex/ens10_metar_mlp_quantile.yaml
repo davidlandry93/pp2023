@@ -1,6 +1,5 @@
 defaults:
 - dataset: pp2023_medium
-- nwp: ens10
 - model: mlp
 - distribution: quantile
 - optimizer: adam

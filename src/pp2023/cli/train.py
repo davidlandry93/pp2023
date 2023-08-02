@@ -7,6 +7,7 @@ import torch.utils.data
 import subprocess
 
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
 import pytorch_lightning.loggers.mlflow
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
@@ -19,6 +20,33 @@ from ..lightning import PP2023Module, LogHyperparametersCallback
 
 
 logger = logging.getLogger(__name__)
+
+
+class CheckpointArtifactCallback(Callback):
+    def __init__(self, best_checkpoint_callback):
+        self.best_checkpoint_callback = best_checkpoint_callback
+        self.previous_best = None
+
+    def on_train_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        node_rank = os.getenv("NODE_RANK", None)
+        if not node_rank or node_rank == 0:
+            if (
+                self.best_checkpoint_callback.best_model_path
+                and self.best_checkpoint_callback.best_model_path != self.previous_best
+            ):
+                logger.info("Logging new best chestkpoint to MLFlow")
+                self.previous_best = self.best_checkpoint_callback.best_model_path
+
+                if os.path.islink("best_checkpoint.ckpt"):
+                    os.unlink("best_checkpoint.ckpt")
+
+                os.symlink(
+                    self.best_checkpoint_callback.best_model_path,
+                    "best_checkpoint.ckpt",
+                )
+                mlflow.log_artifact("best_checkpoint.ckpt")
 
 
 @hydra.main(config_path="../conf", config_name="train", version_base="1.3")
@@ -50,7 +78,6 @@ def train_cli(cfg):
         cfg
     )
     steps_per_epoch = len(list(train_dataloader))
-
     model = build_model_from_config(cfg)
     distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
     optimizer = hydra.utils.instantiate(cfg.ex.optimizer, model.parameters())
@@ -64,16 +91,21 @@ def train_cli(cfg):
         scheduler,
         scheduler_interval=cfg.ex.scheduler.interval,
     )
+
     best_checkpoint_callback = ModelCheckpoint(
         dirpath=os.getcwd(),
         monitor="Val/CRPS/All",
         auto_insert_metric_name=False,
         save_last=True,
     )
+
+    log_checkpoint_callback = CheckpointArtifactCallback(best_checkpoint_callback)
+
     callbacks = [
         LogHyperparametersCallback(cfg.ex),
         LearningRateMonitor(),
         best_checkpoint_callback,
+        log_checkpoint_callback,
         EarlyStopping(
             monitor="Val/CRPS/All",
             min_delta=1e-4,
@@ -100,6 +132,7 @@ def train_cli(cfg):
             experiment_name=cfg.mlflow.experiment_name,
             tracking_uri=cfg.mlflow.tracking_uri,
             run_id=mlflow_run.info.run_id,
+            artifact_location=cfg.mlflow.artifact_location,
         )
 
         trainer = pl.Trainer(
@@ -110,6 +143,11 @@ def train_cli(cfg):
             callbacks=callbacks,
         )
 
+        node_rank = os.getenv("NODE_RANK", None)
+        if not node_rank or node_rank == 0:
+            os.symlink(".hydra", "hydra")
+            mlflow.log_artifact("hydra")
+
         trainer.fit(
             lightning_module,
             train_dataloaders=train_dataloader,
@@ -118,15 +156,6 @@ def train_cli(cfg):
 
         node_rank = os.getenv("NODE_RANK", None)
         if not node_rank or node_rank == 0:
-            os.symlink(".hydra", "hydra")
-            mlflow.log_artifact("hydra")
-
-            if best_checkpoint_callback.best_model_path:
-                os.symlink(
-                    best_checkpoint_callback.best_model_path, "best_checkpoint.ckpt"
-                )
-                mlflow.log_artifact("best_checkpoint.ckpt")
-
             if trainer.state.status == "finished" and cfg.mlflow.save_model:
                 if "model_name" in cfg.mlflow and cfg.mlflow.model_name:
                     mlflow.register_model(

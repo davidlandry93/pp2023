@@ -18,14 +18,21 @@ class MLP(nn.Module):
         use_step_embedding=True,
         use_station_embedding=True,
         embedding_activation=True,
+        use_metadata_features=True,
     ):
         super().__init__()
 
         self.n_variables = n_variables
         self.n_parameters = n_parameters
 
+        self.use_metadata_features = use_metadata_features
+
         # Add to in_features because we concatenate with time features.
-        embedding_blocks = [nn.Linear(in_features + 3, embedding_size)]
+
+        if self.use_metadata_features:
+            in_features += 7
+
+        embedding_blocks = [nn.Linear(in_features, embedding_size)]
         if embedding_activation:
             embedding_blocks.append(nn.SiLU())
         embedding = nn.Sequential(*embedding_blocks)
@@ -57,7 +64,12 @@ class MLP(nn.Module):
         self.mlp = nn.Sequential(hidden, head)
 
     def forward(self, batch):
-        features = torch.cat([batch["features"], batch["time_features"]], dim=-1)
+        if self.use_metadata_features:
+            features = torch.cat(
+                [batch["features"], batch["metadata_features"]], dim=-1
+            )
+        else:
+            features = batch["features"]
 
         projected_features = self.projection(features)
 

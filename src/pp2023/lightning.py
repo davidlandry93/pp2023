@@ -16,8 +16,8 @@ class PP2023Module(pl.LightningModule):
         self,
         model: nn.Module,
         distribution_strategy: Callable[[torch.Tensor], DistributionalForecast],
-        optimizer,
-        scheduler,
+        optimizer=None,
+        scheduler=None,
         scheduler_interval="epoch",
     ):
         super().__init__()
@@ -46,14 +46,18 @@ class PP2023Module(pl.LightningModule):
         return mask
 
     def make_prediction(self, batch, mask):
+        params = self.make_parameters(batch, mask)
+        predicted_distribution = self.distribution_strat.from_tensor(params)
+        return predicted_distribution
+
+    def make_parameters(self, batch, mask):
         nwp_base = self.distribution_strat.nwp_base(batch)
         correction = self.forward(batch)
 
         prediction = nwp_base + correction
-
         masked_prediction = prediction[mask]
-        predicted_distribution = self.distribution_strat.from_tensor(masked_prediction)
-        return predicted_distribution
+
+        return masked_prediction
 
     def compute_loss(
         self,
@@ -142,6 +146,24 @@ class PP2023Module(pl.LightningModule):
                 "count": mask.sum().detach(),
             }
         )
+
+    def predict_step(self, batch, batch_idx):
+        batch_size = batch["features"].shape[0]
+
+        predicted_distribution = self.make_parameters(
+            batch,
+            torch.ones(
+                batch_size,
+                dtype=torch.bool,
+                device=batch["forecast"].device,
+            ),
+        )
+
+        return {
+            "forecast_time": batch["forecast_time"],
+            "step_idx": batch["step_idx"],
+            "prediction": predicted_distribution,
+        }
 
     def on_train_epoch_end(self) -> None:
         sum_counts = 0

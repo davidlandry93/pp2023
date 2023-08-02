@@ -8,6 +8,7 @@ import pandas as pd
 import pathlib
 import torch
 import tqdm
+import urllib.parse
 import xarray as xr
 import yaml
 
@@ -17,6 +18,8 @@ from eddie.robust2023 import StationList
 from eddie.ens10_metar.tasks import RescaleStatistics, rescale_strategy_of_var
 
 from ..cli.base import build_model_from_config, build_dataloaders_from_config
+
+from ..cli.predict import predict
 
 
 def get_run_id_from_model_name(model_name: str) -> str:
@@ -43,6 +46,13 @@ def get_artifact_path_from_run_id(run_id: str) -> pathlib.Path:
     if artifact_uri is None:
         raise RuntimeError("Model does not have an artifact uri")
 
+    parsed_uri = urllib.parse.urlparse(artifact_uri)
+
+    if parsed_uri.scheme != "file":
+        raise ValueError()
+
+    artifact_path = pathlib.Path(parsed_uri.path)
+
     artifact_path = pathlib.Path(artifact_uri)
     return artifact_path
 
@@ -55,7 +65,6 @@ def interpret_tensor_for_variable(
             tensor,
             dims=["batch", "station", "parameter"],
             coords={
-                "parameter": ["mean", "std"],
                 "batch": pd.MultiIndex.from_arrays(
                     (forecast_time, step_idx), names=("forecast_time", "step")
                 ),
@@ -71,26 +80,18 @@ def interpret_tensor_for_variable(
 def interpret_predictions(
     predictions: list[dict[str, torch.Tensor]], stations: xr.DataArray
 ) -> xr.Dataset:
-    datasets = []
-    for p in predictions:
-        prediction_tensor = p["model_predictions"].numpy()
-        forecast_time = p["forecast_time"].numpy().astype("datetime64[ns]")
-        step_idx = p["step_idx"].numpy()
-        t2m = interpret_tensor_for_variable(
-            prediction_tensor[:, :, 0, :],
-            forecast_time=forecast_time,
-            step_idx=step_idx,
-        )
-        si10 = interpret_tensor_for_variable(
-            prediction_tensor[:, :, 1, :],
-            forecast_time=forecast_time,
-            step_idx=step_idx,
-        )
+    forecast_time = predictions["forecast_time"].numpy().astype("datetime64[ns]")
+    step_idx = predictions["step_idx"].numpy()
 
-        datasets.append(xr.Dataset({"t2m": t2m, "si10": si10}))
+    t2m = interpret_tensor_for_variable(
+        predictions["prediction"][:, :, 0], forecast_time, step_idx
+    )
+    si10 = interpret_tensor_for_variable(
+        predictions["prediction"][:, :, 1], forecast_time, step_idx
+    )
 
     return (
-        xr.concat(datasets, dim="forecast_time")
+        xr.Dataset({"t2m": t2m, "si10": si10})
         .sortby("forecast_time")
         .transpose("forecast_time", "step", "station", "parameter")
         .assign_coords(station=stations)
@@ -144,12 +145,28 @@ def make_prediction(
     return predictions
 
 
+def rescale_predictions_ensemble(
+    prediction: xr.Dataset, statistics: xr.Dataset
+) -> xr.Dataset:
+    t2m = prediction.t2m * statistics.std_obs_t2m + statistics.mean_obs_t2m
+    log_si10 = (
+        prediction.si10 * statistics.log_std_obs_si10 + statistics.log_mean_obs_si10
+    )
+    si10 = np.expm1(log_si10)
+
+    return xr.Dataset({"t2m": t2m, "si10": si10})
+
+
 def rescale_predictions(prediction: xr.Dataset, statistics: xr.Dataset) -> xr.Dataset:
     t2m_std = prediction.t2m.sel(parameter="std") * statistics.std_t2m
     t2m_mean = (
         prediction.t2m.sel(parameter="mean") * statistics.std_t2m + statistics.mean_t2m
     )
     t2m = xr.concat([t2m_mean, t2m_std], dim="parameter")
+
+    t2m = prediction.t2m * statistics.std_t2m + statistics.mean_t2m
+
+    si10 = prediction.si10 * statistics.si10_log_std + statistics.si10_log_mean
 
     si10_mean_from_model = prediction.si10.sel(parameter="mean")
     si10_std_from_model = prediction.si10.sel(parameter="std")
@@ -166,16 +183,6 @@ def rescale_predictions(prediction: xr.Dataset, statistics: xr.Dataset) -> xr.Da
 
     si10 = xr.concat([si10_mean, si10_std], dim="parameter")
 
-    # Suppose si10 follows distribution X = N(mean, std).
-    # We did our correction on Y = log(X + 1) to "normalize" the distribution.
-    # So the std we have here is the std of Y.
-    # To map it back to the std of X we need use the formula
-    # std_y = std_x / (mean + 1).
-    # It makes sense if you think of the derivative.
-    # Once we have that, we can map the mean back. See how this post uses the delta
-    # method to make a reasonable approximation:
-    # https://stats.stackexchange.com/questions/93082/if-x-is-normally-distributed-can-logx-also-be-normally-distributed
-
     return xr.Dataset({"t2m": t2m, "si10": si10})
 
 
@@ -185,12 +192,10 @@ class ModelPredictions(aq.Task):
         station_set: str,
         model_name: Optional[str] = None,
         run_id: Optional[str] = None,
-        mlflow_tracking_uri: str = os.getenv("MLFLOW_TRACKING_URI"),
     ):
         self.model_name = model_name
         self.run_id = run_id
         self.station_set = station_set
-        self.mlflow_tracking_uri = mlflow_tracking_uri
 
     def requirements(self):
         return RescaleStatistics(self.station_set)
@@ -198,14 +203,16 @@ class ModelPredictions(aq.Task):
     def run(self, reqs: tuple[xr.Dataset]) -> xr.Dataset:
         rescale_statistics = reqs
 
-        mlflow.set_tracking_uri(self.mlflow_tracking_uri)
         run_id = (
             get_run_id_from_model_name(self.model_name)
             if self.model_name
             else self.run_id
         )
-        predictions = make_prediction(run_id)
+        # predictions = make_prediction(run_id)
+        predictions = predict(run_id)
         predictions_xr = interpret_predictions(predictions, rescale_statistics.station)
-        rescaled_predictions = rescale_predictions(predictions_xr, rescale_statistics)
+        rescaled_predictions = rescale_predictions_ensemble(
+            predictions_xr, rescale_statistics
+        )
 
         return rescaled_predictions

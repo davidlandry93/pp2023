@@ -120,10 +120,12 @@ class NormalParametric(DistributionalForecast):
         loc = params[..., 0]
         scale = params[..., 1]
 
+        scale = torch.clamp(scale, min=1e-6)
+
         self.distribution = td.Normal(loc=loc, scale=scale)
 
     def loss(self, x: torch.Tensor) -> torch.Tensor:
-        return -self.distribution.log_prob(x)
+        return self.crps(x)
 
     def crps(self, x: torch.Tensor) -> torch.Tensor:
         return crps_normal(self.distribution, x)
