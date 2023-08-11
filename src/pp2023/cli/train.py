@@ -16,7 +16,7 @@ from pytorch_lightning.callbacks import (
 )
 
 from .base import build_model_from_config, build_dataloaders_from_config
-from ..lightning import PP2023Module, LogHyperparametersCallback, DummyDataModule
+from ..lightning import PP2023Module, LogHyperparametersCallback, FromConfigDataModule
 
 
 logger = logging.getLogger(__name__)
@@ -131,16 +131,15 @@ def train_cli(cfg):
             patience=cfg.ex.early_stopping_patience,
         ),
         best_checkpoint_callback,
+        CheckpointArtifactCallback(best_checkpoint_callback),
     ]
 
     trainer = pl.Trainer(
         accelerator="auto",
-        strategy="ddp",
         log_every_n_steps=cfg.ex.log_every_n_steps,
         logger=mlflow_logger,
         max_epochs=cfg.ex.get("max_epochs", None),
         callbacks=callbacks,
-        enable_progress_bar=False,
     )
 
     try:
@@ -160,7 +159,7 @@ def train_cli(cfg):
             scheduler_interval=cfg.ex.scheduler.interval,
         )
 
-        datamodule = DummyDataModule(cfg)
+        datamodule = FromConfigDataModule(cfg)
 
         n_parameters = sum(p.numel() for p in model.parameters())
 

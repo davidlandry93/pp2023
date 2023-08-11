@@ -17,7 +17,7 @@ from .distribution import DistributionalForecast
 from .cli.base import build_dataloaders_from_config
 
 
-class DummyDataModule(pl.LightningDataModule):
+class FromConfigDataModule(pl.LightningDataModule):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -236,8 +236,10 @@ class PP2023Module(pl.LightningModule):
         gathered_crps = self.all_gather(self.validation_step_crpss)
         gathered_counts = self.all_gather(self.validation_step_counts)
 
-        gathered_crps_pt = torch.cat(gathered_crps, dim=0)
-        gathered_counts_pt = torch.cat(gathered_counts, dim=0)
+        print("GATHERED BEFORE CAT", gathered_crps)
+
+        gathered_crps_pt = torch.stack(gathered_crps)
+        gathered_counts_pt = torch.stack(gathered_counts)
 
         print("GATHERED", os.getenv("LOCAL_RANK"), gathered_crps_pt.shape)
         print("GATHERED", os.getenv("LOCAL_RANK"), gathered_crps_pt)
