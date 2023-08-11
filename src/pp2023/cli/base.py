@@ -23,25 +23,21 @@ def build_dataloaders_from_config(
     local_rank = os.getenv("LOCAL_RANK", None)
     node_rank = os.getenv("NODE_RANK", None)
     world_size = os.getenv("WORLD_SIZE", None)
+
+    print("LOCAL RANK WHEN DATALOADER", os.getenv("LOCAL_RANK"))
+
     if local_rank is not None:
-        print(os.environ)
         train_sampler = torch.utils.data.DistributedSampler(
             train_dataset,
-            num_replicas=int(world_size),
-            rank=int(local_rank),
             shuffle=True,
             drop_last=True,
         )
         val_sampler = torch.utils.data.DistributedSampler(
             val_dataset,
-            num_replicas=int(world_size),
-            rank=int(local_rank),
             drop_last=True,
         )
         test_sampler = torch.utils.data.DistributedSampler(
             test_dataset,
-            num_replicas=int(world_size),
-            rank=int(local_rank),
             drop_last=True,
         )
     else:

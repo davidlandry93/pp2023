@@ -4,7 +4,7 @@ import math
 import omegaconf as oc
 import pandas as pd
 import pytorch_lightning as pl
-from pytorch_lightning.utilities.types import STEP_OUTPUT
+from pytorch_lightning.utilities.types import STEP_OUTPUT, TRAIN_DATALOADERS
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -14,6 +14,25 @@ import os
 from torch.optim.optimizer import Optimizer
 
 from .distribution import DistributionalForecast
+from .cli.base import build_dataloaders_from_config
+
+
+class DummyDataModule(pl.LightningDataModule):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+
+    def train_dataloader(self):
+        loader, _, _ = build_dataloaders_from_config(self.cfg)
+        return loader
+
+    def val_dataloader(self):
+        _, loader, _ = build_dataloaders_from_config(self.cfg)
+        return loader
+
+    def test_dataloader(self):
+        _, _, loader = build_dataloaders_from_config(self.cfg)
+        return loader
 
 
 class PP2023Module(pl.LightningModule):
@@ -24,6 +43,9 @@ class PP2023Module(pl.LightningModule):
         optimizer=None,
         scheduler=None,
         scheduler_interval="epoch",
+        train_dataloader=None,
+        val_dataloader=None,
+        test_dataloader=None,
     ):
         super().__init__()
         self.model = model
@@ -121,7 +143,7 @@ class PP2023Module(pl.LightningModule):
         print("Log CRPS", os.getenv("LOCAL_RANK"))
         crpss = predicted_distribution.crps(target)
 
-        print("Calling Log", os.getenv("LOCAL_RANK"))
+        print("Calling Log CRPS", os.getenv("LOCAL_RANK"))
         self.log(
             f"{prefix}/CRPS/All",
             crpss.mean(),
@@ -129,7 +151,7 @@ class PP2023Module(pl.LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
-        print("Done Calling Log", os.getenv("LOCAL_RANK"))
+        print("Done Calling Log CRPS", os.getenv("LOCAL_RANK"))
         # self.log(
         #     f"{prefix}/CRPS/t2m",
         #     crpss[..., 0].mean(),
@@ -166,7 +188,7 @@ class PP2023Module(pl.LightningModule):
 
         loss = self.compute_loss(predicted_distribution, masked_target, log_step=False)
 
-        # self.log_crps(predicted_distribution, masked_target)
+        self.log_crps(predicted_distribution, masked_target)
         print("After log_crps", os.getenv("LOCAL_RANK"))
 
         return loss
@@ -183,18 +205,13 @@ class PP2023Module(pl.LightningModule):
 
         crps = self.log_crps(predicted_distribution, masked_target, prefix="Val")
 
-        self.validation_step_crpss.append(crps.mean())
-        self.validation_step_counts.append(mask.sum())
+        self.validation_step_crpss.append(crps.mean().detach())
+        self.validation_step_counts.append(mask.sum().detach())
 
     def on_train_epoch_end(self) -> None:
         print("Train epoch end", os.getenv("LOCAL_RANK"))
         self.validation_step_counts = []
         self.validation_step_crpss = []
-
-    def on_train_batch_end(
-        self, outputs: STEP_OUTPUT, batch: Any, batch_idx: int
-    ) -> None:
-        print("Train batch end", os.getenv("LOCAL_RANK"))
 
     def predict_step(self, batch, batch_idx):
         batch_size = batch["features"].shape[0]
@@ -214,27 +231,30 @@ class PP2023Module(pl.LightningModule):
             "prediction": predicted_distribution,
         }
 
-    # def on_train_epoch_end(self) -> None:
-    #     gathered = self.all_gather(self.validation_step_outputs)
-    #     print(gathered)
-    #     if self.trainer.is_global_zero:
-    #         breakpoint()
+    def on_train_epoch_end(self) -> None:
+        print("Train batch end", os.getenv("LOCAL_RANK"))
+        gathered_crps = self.all_gather(self.validation_step_crpss)
+        gathered_counts = self.all_gather(self.validation_step_counts)
 
-    #         sum_counts = 0
-    #         sum_crps = 0
+        gathered_crps_pt = torch.cat(gathered_crps, dim=0)
+        gathered_counts_pt = torch.cat(gathered_counts, dim=0)
 
-    #         for r in gathered:
-    #             count = r["count"]
-    #             sum_crps += count * r["crps"]
-    #             sum_counts += count
+        print("GATHERED", os.getenv("LOCAL_RANK"), gathered_crps_pt.shape)
+        print("GATHERED", os.getenv("LOCAL_RANK"), gathered_crps_pt)
+        print("GATHERED_COUNTS", os.getenv("LOCAL_RANK"), gathered_counts_pt)
 
-    #         crps_epoch = sum_crps / sum_counts
+        pytorch_crps_epoch = (
+            gathered_counts_pt * gathered_crps_pt
+        ).sum() / gathered_counts_pt.sum()
 
-    #         if (crps_epoch < self.min_crps).item():
-    #             self.log("min_crps", crps_epoch, rank_zero_only=True)
-    #             self.min_crps = crps_epoch
+        print("pytorch_crps", os.getenv("LOCAL_RANK"), pytorch_crps_epoch)
 
-    #     self.validation_step_outputs = []
+        if (pytorch_crps_epoch < self.min_crps).item():
+            self.log("min_crps", pytorch_crps_epoch, rank_zero_only=True)
+            self.min_crps = pytorch_crps_epoch
+
+        self.validation_step_crpss = []
+        self.validation_step_counts = []
 
     def on_test_epoch_end(self) -> None:
         test_loss = self.test_loss.compute()

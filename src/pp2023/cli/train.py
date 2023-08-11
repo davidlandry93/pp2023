@@ -16,7 +16,7 @@ from pytorch_lightning.callbacks import (
 )
 
 from .base import build_model_from_config, build_dataloaders_from_config
-from ..lightning import PP2023Module, LogHyperparametersCallback
+from ..lightning import PP2023Module, LogHyperparametersCallback, DummyDataModule
 
 
 logger = logging.getLogger(__name__)
@@ -73,76 +73,39 @@ def train_cli(cfg):
 
     torch.manual_seed(cfg.seed)
 
-    mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
-    mlflow_client = mlflow.MlflowClient()
-    experiments = mlflow_client.search_experiments()
-    experiments = [ex for ex in experiments if ex.name == cfg.mlflow.experiment_name]
-
-    if len(experiments) == 0:
-        experiment_id = mlflow_client.create_experiment(name=cfg.mlflow.experiment_name)
-    else:
-        [experiment] = experiments
-        experiment_id = experiment.experiment_id
-
-    train_dataloader, val_dataloader, test_dataloader = build_dataloaders_from_config(
-        cfg
-    )
-
-    # steps_per_epoch = 0
-    # for _ in train_dataloader:
-    #     steps_per_epoch += 1
-
-    steps_per_epoch = len(train_dataloader)
-
-    model = build_model_from_config(cfg)
-    distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
-    optimizer = hydra.utils.instantiate(cfg.ex.optimizer, model.parameters())
-    scheduler = hydra.utils.instantiate(
-        cfg.ex.scheduler.instance, optimizer, steps_per_epoch=steps_per_epoch
-    )
-    lightning_module = PP2023Module(
-        model,
-        distribution_strat,
-        optimizer,
-        scheduler,
-        scheduler_interval=cfg.ex.scheduler.interval,
-    )
-
-    callbacks = [
-        LogHyperparametersCallback(cfg.ex),
-        LearningRateMonitor(),
-        EarlyStopping(
-            monitor="Val/CRPS/All",
-            min_delta=1e-4,
-            patience=cfg.ex.early_stopping_patience,
-        ),
-    ]
-
-    best_checkpoint_callback = ModelCheckpoint(
-        dirpath=os.getcwd(),
-        monitor="Val/CRPS/All",
-        auto_insert_metric_name=False,
-        save_last=True,
-    )
-
-    callbacks.append(best_checkpoint_callback)
-
-    n_parameters = sum(p.numel() for p in model.parameters())
-
-    tags = {
-        "cwd": os.getcwd(),
-        "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
-        "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID", ""),
-        "slurm_array_task_id": os.getenv("SLUM_ARRAY_TASK_ID", ""),
-        "n_parameters": n_parameters,
-    }
-
     if is_main_process:
+        mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
+        mlflow_client = mlflow.MlflowClient()
+        experiments = mlflow_client.search_experiments()
+        experiments = [
+            ex for ex in experiments if ex.name == cfg.mlflow.experiment_name
+        ]
+
+        if len(experiments) == 0:
+            print("Experiment not found. Creating it.")
+            experiment_id = mlflow_client.create_experiment(
+                name=cfg.mlflow.experiment_name
+            )
+        else:
+            print("Found experiment.")
+            [experiment] = experiments
+            experiment_id = experiment.experiment_id
+
+        tags = {
+            "cwd": os.getcwd(),
+            "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
+            "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID", ""),
+            "slurm_array_task_id": os.getenv("SLUM_ARRAY_TASK_ID", ""),
+        }
+
+        print("Starting run")
+        print("Node rank, local rank: ", node_rank, local_rank)
         mlflow_run = mlflow.start_run(
             experiment_id=experiment_id,
             tags=tags,
             run_name=cfg.mlflow.run_name,
         )
+        print("Done starting run")
         mlflow_logger = pytorch_lightning.loggers.mlflow.MLFlowLogger(
             experiment_name=cfg.mlflow.experiment_name,
             tracking_uri=cfg.mlflow.tracking_uri,
@@ -153,25 +116,60 @@ def train_cli(cfg):
         mlflow_run = None
         mlflow_logger = None
 
+    best_checkpoint_callback = ModelCheckpoint(
+        dirpath=os.getcwd(),
+        monitor="Val/CRPS/All",
+        auto_insert_metric_name=False,
+        save_last=True,
+    )
+    callbacks = [
+        LogHyperparametersCallback(cfg.ex),
+        LearningRateMonitor(),
+        EarlyStopping(
+            monitor="Val/CRPS/All",
+            min_delta=1e-4,
+            patience=cfg.ex.early_stopping_patience,
+        ),
+        best_checkpoint_callback,
+    ]
+
+    trainer = pl.Trainer(
+        accelerator="auto",
+        strategy="ddp",
+        log_every_n_steps=cfg.ex.log_every_n_steps,
+        logger=mlflow_logger,
+        max_epochs=cfg.ex.get("max_epochs", None),
+        callbacks=callbacks,
+        enable_progress_bar=False,
+    )
+
     try:
-        trainer = pl.Trainer(
-            accelerator="auto",
-            strategy="ddp",
-            log_every_n_steps=cfg.ex.log_every_n_steps,
-            logger=mlflow_logger,
-            max_epochs=cfg.ex.get("max_epochs", None),
-            callbacks=callbacks,
+        steps_per_epoch = cfg.ex.dataset.train_length
+
+        model = build_model_from_config(cfg)
+        distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
+        optimizer = hydra.utils.instantiate(cfg.ex.optimizer, model.parameters())
+        scheduler = hydra.utils.instantiate(
+            cfg.ex.scheduler.instance, optimizer, steps_per_epoch=steps_per_epoch
+        )
+        lightning_module = PP2023Module(
+            model,
+            distribution_strat,
+            optimizer,
+            scheduler,
+            scheduler_interval=cfg.ex.scheduler.interval,
         )
 
+        datamodule = DummyDataModule(cfg)
+
+        n_parameters = sum(p.numel() for p in model.parameters())
+
         if is_main_process:
+            mlflow.set_tag("n_parameters", n_parameters)
             os.symlink(".hydra", "hydra")
             mlflow.log_artifact("hydra")
 
-        trainer.fit(
-            lightning_module,
-            train_dataloaders=train_dataloader,
-            val_dataloaders=val_dataloader,
-        )
+        trainer.fit(lightning_module, datamodule=datamodule)
 
         if is_main_process:
             if trainer.state.status == "finished" and cfg.mlflow.save_model:
@@ -183,4 +181,5 @@ def train_cli(cfg):
             mlflow.log_artifact("last.ckpt")
     finally:
         if is_main_process:
-            mlflow.end_run()
+            status = "FINISHED" if trainer.state.status == "finished" else "FAILED"
+            mlflow.end_run(status)
