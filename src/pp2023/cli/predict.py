@@ -28,29 +28,38 @@ def artifact_path_of_run(run_id: str, mlflow_tracking_uri=None) -> pathlib.Path:
     artifact_uri = mlflow_run.info.artifact_uri
     parsed_uri = urllib.parse.urlparse(artifact_uri)
 
-    if parsed_uri.scheme != "file":
-        raise ValueError()
+    if parsed_uri.scheme == "file":
+        artifact_path = pathlib.Path(parsed_uri.path)
+    else:
+        artifact_path = pathlib.Path(artifact_uri)
 
-    artifact_path = pathlib.Path(parsed_uri.path)
     return artifact_path
 
 
-def load_cfg_from_run(artifact_path: pathlib.Path) -> oc.DictConfig:
+def load_cfg_from_run(artifact_path: pathlib.Path, overrides=None) -> oc.DictConfig:
     overrides_file = artifact_path / "hydra" / "overrides.yaml"
     with overrides_file.open() as f:
-        overrides = yaml.safe_load(f)
+        run_overrides = yaml.safe_load(f)
+
+    if overrides is None:
+        overrides = []
+
+    merged_overrides = [*run_overrides, "ex.dataset.maker.cache=False", *overrides]
+    print(merged_overrides)
 
     with hydra.initialize_config_module("pp2023.conf", version_base="1.3"):
-        cfg = hydra.compose("train", [*overrides, "ex.dataset.maker.cache=False"])
+        cfg = hydra.compose("train", merged_overrides)
+
+    print(cfg)
 
     return cfg
 
 
-def predict(run_id, mlflow_tracking_uri=None, test_set=False):
+def predict(run_id, mlflow_tracking_uri=None, test_set=False, overrides=None):
     artifact_path = artifact_path_of_run(
         run_id, mlflow_tracking_uri=mlflow_tracking_uri
     )
-    cfg = load_cfg_from_run(artifact_path)
+    cfg = load_cfg_from_run(artifact_path, overrides=overrides)
 
     _, val_loader, test_loader = build_dataloaders_from_config(cfg)
 

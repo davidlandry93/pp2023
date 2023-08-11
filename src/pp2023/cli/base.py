@@ -2,6 +2,7 @@ import omegaconf as oc
 import hydra
 import logging
 import torch
+import os
 import torch.utils.data
 
 logger = logging.getLogger(__name__)
@@ -19,22 +20,57 @@ def build_dataloaders_from_config(
         cfg.ex.dataset.maker,
     )
 
+    local_rank = os.getenv("LOCAL_RANK", None)
+    node_rank = os.getenv("NODE_RANK", None)
+    world_size = os.getenv("WORLD_SIZE", None)
+    if local_rank is not None:
+        print(os.environ)
+        train_sampler = torch.utils.data.DistributedSampler(
+            train_dataset,
+            num_replicas=int(world_size),
+            rank=int(local_rank),
+            shuffle=True,
+            drop_last=True,
+        )
+        val_sampler = torch.utils.data.DistributedSampler(
+            val_dataset,
+            num_replicas=int(world_size),
+            rank=int(local_rank),
+            drop_last=True,
+        )
+        test_sampler = torch.utils.data.DistributedSampler(
+            test_dataset,
+            num_replicas=int(world_size),
+            rank=int(local_rank),
+            drop_last=True,
+        )
+    else:
+        train_sampler = None
+        val_sampler = None
+        test_sampler = None
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=cfg.ex.batch_size,
+        batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
+        sampler=train_sampler,
+        persistent_workers=True,
     )
 
     val_dataloader = torch.utils.data.DataLoader(
         val_dataset,
-        batch_size=cfg.ex.batch_size,
+        batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
+        sampler=val_sampler,
+        persistent_workers=True,
     )
 
     test_dataloader = torch.utils.data.DataLoader(
         test_dataset,
-        batch_size=cfg.ex.batch_size,
+        batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
+        sampler=test_sampler,
+        persistent_workers=True,
     )
 
     return train_dataloader, val_dataloader, test_dataloader

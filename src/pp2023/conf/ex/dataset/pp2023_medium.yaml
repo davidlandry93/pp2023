@@ -8,4 +8,4 @@ maker:
   input_dir: ${oc.env:EDDIE_LOCAL_STORE}/ens10_metar/${..station_subset}/sets/
   limit_features: ${..n_features}
   to_32bits: false
-  cache: true
+  cache: false

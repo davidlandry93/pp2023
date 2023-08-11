@@ -4,6 +4,8 @@ import torch.distributions as td
 
 SQRT_PI = math.sqrt(math.pi)
 
+LOG_SI10_CLAMP = -0.2
+
 
 def crps_empirical(Q: torch.tensor, y: torch.tensor, sorted=False):
     """Compute the CRPS of an empirical distribution. Q is the sorted samples of the empirical distribution,
@@ -118,6 +120,15 @@ class NormalParametricStrategy(DistributionalForecastStrategy):
 class NormalParametric(DistributionalForecast):
     def __init__(self, params):
         loc = params[..., 0]
+
+        loc_t2m, loc_log_si10 = loc[..., 0], loc[..., 1]
+
+        # Restrain log_si10 to a minimum of zero so that expm1(log_si10) will also be
+        # restrainted to zero when rescaling to the usual units.
+        loc_log_si10 = torch.clamp(loc_log_si10, min=LOG_SI10_CLAMP)
+
+        loc = torch.stack([loc_t2m, loc_log_si10], dim=-1)
+
         scale = params[..., 1]
 
         scale = torch.clamp(scale, min=1e-6)
@@ -141,6 +152,13 @@ class DeterministicStrategy(DistributionalForecastStrategy):
 
 class DeterministicForecast(DistributionalForecast):
     def __init__(self, params):
+        t2m, log_si10 = params[..., 0, :], params[..., 1, :]
+
+        # Restrain log_si10 to a minimum of zero so that expm1(log_si10) will also be
+        # restrainted to zero when rescaling to the usual units.
+        log_si10 = torch.clamp(log_si10, min=LOG_SI10_CLAMP)
+
+        params = torch.stack([t2m, log_si10], dim=-2)
         self.preds = params.squeeze()
 
     def loss(self, x: torch.Tensor):
@@ -152,6 +170,15 @@ class DeterministicForecast(DistributionalForecast):
 
 class QuantileRegression(DistributionalForecast):
     def __init__(self, params, regularization=1e-5):
+        t2m, log_si10 = params[..., 0, :], params[..., 1, :]
+
+        # Restrain log_si10 to a minimum of zero so that expm1(log_si10) will also be
+        # restrainted to zero when rescaling to the usual units.
+        log_si10 = torch.clamp(log_si10, min=LOG_SI10_CLAMP)
+
+        params = torch.stack([t2m, log_si10], dim=-2)
+        params, _ = torch.sort(params)
+
         self.parameters = params
         self.r = regularization
 
@@ -170,7 +197,7 @@ class QuantileRegression(DistributionalForecast):
         return loss.mean(dim=-1)
 
     def loss(self, x: torch.Tensor):
-        misalignments = self.r * torch.square(
+        misalignments = self.r * -torch.square(
             torch.clamp(self.parameters[..., 1:] - self.parameters[..., :-1], max=0)
         ).sum(dim=-1)
 
@@ -186,7 +213,7 @@ class QuantileRegression(DistributionalForecast):
         return crps
 
     def crps(self, x: torch.Tensor):
-        return crps_empirical(self.parameters, x.unsqueeze(-1), sorted=False)
+        return crps_empirical(self.parameters, x.unsqueeze(-1), sorted=True)
 
 
 class QuantileRegressionStrategy(DistributionalForecastStrategy):
@@ -202,7 +229,7 @@ class QuantileRegressionStrategy(DistributionalForecastStrategy):
         member_idx = torch.round(torch.linspace(0, n_members - 1, n_quantile)).int()
 
         # Use the nearest member quantile as a base for the forcetast.
-        # This we we decouple the number of members and the number of quantiles.
+        # This way we decouple the number of members and the number of quantiles.
         return members_values[:, member_idx].transpose(1, 2).transpose(2, 3)
 
     def from_tensor(self, x: torch.Tensor) -> "QuantileRegression":

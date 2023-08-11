@@ -30,13 +30,13 @@ class CheckpointArtifactCallback(Callback):
     def on_train_epoch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule
     ) -> None:
-        node_rank = os.getenv("NODE_RANK", None)
-        if not node_rank or node_rank == 0:
+        print("On train epoch end checkpoint callback", os.getenv("LOCAL_RANK"))
+        if trainer.is_global_zero:
             if (
                 self.best_checkpoint_callback.best_model_path
                 and self.best_checkpoint_callback.best_model_path != self.previous_best
             ):
-                logger.info("Logging new best chestkpoint to MLFlow")
+                logger.debug("Logging new best chestkpoint to MLFlow")
                 self.previous_best = self.best_checkpoint_callback.best_model_path
 
                 if os.path.islink("best_checkpoint.ckpt"):
@@ -51,6 +51,11 @@ class CheckpointArtifactCallback(Callback):
 
 @hydra.main(config_path="../conf", config_name="train", version_base="1.3")
 def train_cli(cfg):
+    node_rank = os.getenv("NODE_RANK", None)
+    local_rank = os.getenv("LOCAL_RANK", None)
+
+    is_main_process = node_rank is None or (node_rank == 0 and local_rank == 0)
+
     logger.info(f"Working from: {os.getcwd()}")
     if "pre" in cfg and cfg["pre"] is not None:
         for k in cfg["pre"]:
@@ -62,6 +67,11 @@ def train_cli(cfg):
 
     if torch.backends.mps.is_available():
         torch.set_default_dtype(torch.float32)
+
+    # See https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html.
+    torch.set_float32_matmul_precision("high")
+
+    torch.manual_seed(cfg.seed)
 
     mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
     mlflow_client = mlflow.MlflowClient()
@@ -77,7 +87,13 @@ def train_cli(cfg):
     train_dataloader, val_dataloader, test_dataloader = build_dataloaders_from_config(
         cfg
     )
-    steps_per_epoch = len(list(train_dataloader))
+
+    # steps_per_epoch = 0
+    # for _ in train_dataloader:
+    #     steps_per_epoch += 1
+
+    steps_per_epoch = len(train_dataloader)
+
     model = build_model_from_config(cfg)
     distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
     optimizer = hydra.utils.instantiate(cfg.ex.optimizer, model.parameters())
@@ -92,6 +108,16 @@ def train_cli(cfg):
         scheduler_interval=cfg.ex.scheduler.interval,
     )
 
+    callbacks = [
+        LogHyperparametersCallback(cfg.ex),
+        LearningRateMonitor(),
+        EarlyStopping(
+            monitor="Val/CRPS/All",
+            min_delta=1e-4,
+            patience=cfg.ex.early_stopping_patience,
+        ),
+    ]
+
     best_checkpoint_callback = ModelCheckpoint(
         dirpath=os.getcwd(),
         monitor="Val/CRPS/All",
@@ -99,19 +125,7 @@ def train_cli(cfg):
         save_last=True,
     )
 
-    log_checkpoint_callback = CheckpointArtifactCallback(best_checkpoint_callback)
-
-    callbacks = [
-        LogHyperparametersCallback(cfg.ex),
-        LearningRateMonitor(),
-        best_checkpoint_callback,
-        log_checkpoint_callback,
-        EarlyStopping(
-            monitor="Val/CRPS/All",
-            min_delta=1e-4,
-            patience=cfg.ex.early_stopping_patience,
-        ),
-    ]
+    callbacks.append(best_checkpoint_callback)
 
     n_parameters = sum(p.numel() for p in model.parameters())
 
@@ -123,28 +137,33 @@ def train_cli(cfg):
         "n_parameters": n_parameters,
     }
 
-    with mlflow.start_run(
-        experiment_id=experiment_id,
-        tags=tags,
-        run_name=cfg.mlflow.run_name,
-    ) as mlflow_run:
+    if is_main_process:
+        mlflow_run = mlflow.start_run(
+            experiment_id=experiment_id,
+            tags=tags,
+            run_name=cfg.mlflow.run_name,
+        )
         mlflow_logger = pytorch_lightning.loggers.mlflow.MLFlowLogger(
             experiment_name=cfg.mlflow.experiment_name,
             tracking_uri=cfg.mlflow.tracking_uri,
             run_id=mlflow_run.info.run_id,
             artifact_location=cfg.mlflow.artifact_location,
         )
+    else:
+        mlflow_run = None
+        mlflow_logger = None
 
+    try:
         trainer = pl.Trainer(
             accelerator="auto",
+            strategy="ddp",
             log_every_n_steps=cfg.ex.log_every_n_steps,
             logger=mlflow_logger,
             max_epochs=cfg.ex.get("max_epochs", None),
             callbacks=callbacks,
         )
 
-        node_rank = os.getenv("NODE_RANK", None)
-        if not node_rank or node_rank == 0:
+        if is_main_process:
             os.symlink(".hydra", "hydra")
             mlflow.log_artifact("hydra")
 
@@ -154,8 +173,7 @@ def train_cli(cfg):
             val_dataloaders=val_dataloader,
         )
 
-        node_rank = os.getenv("NODE_RANK", None)
-        if not node_rank or node_rank == 0:
+        if is_main_process:
             if trainer.state.status == "finished" and cfg.mlflow.save_model:
                 if "model_name" in cfg.mlflow and cfg.mlflow.model_name:
                     mlflow.register_model(
@@ -163,3 +181,6 @@ def train_cli(cfg):
                     )
 
             mlflow.log_artifact("last.ckpt")
+    finally:
+        if is_main_process:
+            mlflow.end_run()

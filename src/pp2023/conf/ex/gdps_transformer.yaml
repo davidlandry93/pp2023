@@ -1,5 +1,5 @@
 defaults:
-- dataset: pp2023_medium
+- dataset: gdps_prebatch
 - model: transformer
 - distribution: quantile
 - optimizer: adam
@@ -8,7 +8,7 @@ defaults:
 
 timeout_min: 1200
 
-batch_size: 64
+batch_size:
 max_epochs: 2000 
 log_every_n_steps: 20
 early_stopping_patience: 800
@@ -18,9 +18,6 @@ early_stopping_patience: 800
 
 distribution:
   n_parameters: 32
-
-dataset:
-  n_features: 32
 
 scheduler:
   instance:

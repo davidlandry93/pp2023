@@ -6,3 +6,4 @@ use_step_embedding: false
 use_member_embedding: false
 embedding_activation: true
 use_metadata_features: true
+sort_target_variables: false

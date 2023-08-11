@@ -1,11 +1,12 @@
 from typing import Any
 
 import logging
+import os
 import math
 import numpy as np
-import random
 import pathlib
 import torch
+import torch.utils.data
 
 _logger = logging.getLogger(__name__)
 
@@ -20,21 +21,26 @@ class TorchRecordDataset:
         limit_features=None,
         to_32bits=False,
         shuffle=False,
+        limit=None,
     ):
         self.input_dir = pathlib.Path(input_dir)
         self.files = list(self.input_dir.glob("*.pt"))
 
         if shuffle:
-            random.shuffle(self.files)
+            perm = torch.randperm(len(self.files))
+            self.files = [self.files[x] for x in perm]
         else:
             self.files = sorted(self.files)
 
         self.limit_features = limit_features
         self.to_32bits = to_32bits
-        self.use_metadata_features = use_metadata_features
+        self.limit = limit
 
     def __len__(self):
-        return len(self.files)
+        if self.limit is not None:
+            return min(len(self.files), self.limit)
+        else:
+            return len(self.files)
 
     def __getitem__(self, idx):
         example = torch.load(self.files[idx])
@@ -86,34 +92,70 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
         self.shuffle_steps = shuffle_steps
         self.min_rows = min_rows
 
-    def __iter__(self):
+    def get_worker_bounds(self):
+        local_rank = os.getenv("LOCAL_RANK", None)
+        if local_rank is not None:
+            return self.get_worker_bounds_ddp()
+        else:
+            return self.get_worker_bounds_single()
+
+    def get_worker_bounds_single(self):
         worker_info = torch.utils.data.get_worker_info()
 
         if worker_info is None:
-            input_dataset_it = iter(self.input_dataset)
+            iter_start, iter_end = 0, len(self.input_dataset)
         else:
             # Taken from:
             # https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset
             per_worker = int(
                 math.ceil(len(self.input_dataset) / float(worker_info.num_workers))
             )
-            worker_id = worker_info.id
+            worker_id = int(worker_info.id)
             iter_start = worker_id * per_worker
             iter_end = min(iter_start + per_worker, len(self.input_dataset))
 
-            _logger.debug(f"Worker bounds: {iter_start} to {iter_end}")
+        return iter_start, iter_end
 
-            inner_idx = list(range(iter_start, iter_end))
-            if self.shuffle_inner:
-                random.shuffle(inner_idx)
+    def get_worker_bounds_ddp(self):
+        local_rank = int(os.getenv("LOCAL_RANK"))
+        world_size = int(os.getenv("WORLD_SIZE"))
 
-            input_dataset_it = (self.input_dataset[i] for i in inner_idx)
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            n_workers_per_node = 1
+            worker_id = 0
+        else:
+            n_workers_per_node = int(worker_info.num_workers)
+            worker_id = int(worker_info.id)
+
+        n_workers = n_workers_per_node * world_size
+        per_worker = int(math.ceil(len(self.input_dataset) / float(n_workers)))
+
+        print("LOCAL_RANK", local_rank, "WORLD_SIZE", world_size)
+
+        worker_id = local_rank * n_workers_per_node + worker_id
+
+        iter_start = worker_id * per_worker
+        iter_end = min(iter_start + per_worker, len(self.input_dataset))
+
+        return iter_start, iter_end
+
+    def __iter__(self):
+        iter_start, iter_end = self.get_worker_bounds()
+
+        print(f"Worker bounds: {iter_start} to {iter_end}")
+
+        inner_idx = torch.tensor(list(range(iter_start, iter_end)))
+        if self.shuffle_inner:
+            inner_idx = inner_idx[torch.randperm(len(inner_idx))]
+
+        input_dataset_it = (self.input_dataset[i] for i in inner_idx)
 
         for example in input_dataset_it:
-            unique_steps = self.list_steps(example)
+            unique_steps = torch.tensor(self.list_steps(example))
 
             if self.shuffle_steps:
-                random.shuffle(unique_steps)
+                unique_steps = unique_steps[torch.randperm(len(unique_steps))]
             else:
                 unique_steps = sorted(unique_steps)
 

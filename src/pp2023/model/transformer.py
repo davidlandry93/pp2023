@@ -31,7 +31,7 @@ class AttentionHead(nn.Module):
 
 
 class AttentionLayer(nn.Module):
-    def __init__(self, n_heads, in_features, out_features):
+    def __init__(self, n_heads, in_features, out_features, activation_function=nn.SiLU):
         super().__init__()
 
         self.heads = nn.ModuleList(
@@ -43,7 +43,7 @@ class AttentionLayer(nn.Module):
 
         self.linear = nn.Linear(out_features, out_features)
         self.layer_norm = nn.LayerNorm([out_features])
-        self.relu = nn.LeakyReLU(0.1)
+        self.activation = activation_function()
 
     def forward(self, x):
         xs = []
@@ -54,17 +54,26 @@ class AttentionLayer(nn.Module):
         heads_cat = torch.cat(xs, dim=-1)
         out = self.linear(heads_cat)
 
-        return self.relu(self.layer_norm(out))
+        return self.activation(self.layer_norm(out))
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, n_heads, in_features, out_features, dropout=0.0):
+    def __init__(
+        self,
+        n_heads,
+        in_features,
+        out_features,
+        dropout=0.0,
+        activation_function=nn.SiLU,
+    ):
         super().__init__()
 
-        self.attention_layer = AttentionLayer(n_heads, in_features, out_features)
+        self.attention_layer = AttentionLayer(
+            n_heads, in_features, out_features, activation_function=activation_function
+        )
         self.feed_forward = nn.Sequential(
             nn.Linear(out_features, out_features),
-            nn.LeakyReLU(0.1),
+            activation_function(),
             nn.Linear(out_features, out_features),
         )
 
@@ -83,6 +92,9 @@ class AttentionBlock(nn.Module):
         return x
 
 
+ACTIVATION_FNS = {"silu": nn.SiLU, "relu": nn.ReLU, "lrelu": nn.LeakyReLU}
+
+
 class TransformerModel(nn.Module):
     """Transformer-like model that performs post-processing on the SMC dataset."""
 
@@ -98,10 +110,14 @@ class TransformerModel(nn.Module):
         add_meta_tokens=False,
         n_stations=None,
         n_steps=None,
+        n_members=10,
         n_time_models=12,
         select_member="first",
+        activation_function="silu",
     ):
         super().__init__()
+
+        activation_function_class = ACTIVATION_FNS[activation_function]
 
         self.n_variables = n_variables
         self.n_parameters = n_parameters
@@ -118,7 +134,10 @@ class TransformerModel(nn.Module):
 
         self.time_model_span = math.ceil(N_DAYS_YEAR / n_time_models)
 
-        self.embedding = nn.Linear(in_features, embedding_size, bias=True)
+        embedding_in_features = (
+            in_features * n_members if select_member == "feature" else in_features
+        )
+        self.embedding = nn.Linear(embedding_in_features, embedding_size, bias=True)
 
         self.day_of_year_embedding = nn.Parameter(
             torch.rand(n_time_models + 1, embedding_size)
@@ -127,7 +146,13 @@ class TransformerModel(nn.Module):
 
         self.attention_layers = nn.Sequential(
             *[
-                AttentionBlock(n_heads, embedding_size, embedding_size, dropout=dropout)
+                AttentionBlock(
+                    n_heads,
+                    embedding_size,
+                    embedding_size,
+                    dropout=dropout,
+                    activation_function=activation_function_class,
+                )
                 for _ in range(n_blocks)
             ]
         )
@@ -137,7 +162,14 @@ class TransformerModel(nn.Module):
     def forward(self, batch):
         batch_size, n_members, n_stations, n_features = batch["features"].shape
 
-        embedded_features = self.embedding(batch["features"])
+        if self.select_member == "feature":
+            pre_embedding_features = batch["features"].reshape(
+                batch_size, n_stations, n_features * n_members
+            )
+        else:
+            pre_embedding_features = batch["features"]
+
+        embedded_features = self.embedding(pre_embedding_features)
 
         if self.select_member == "first":
             selected_features = embedded_features[:, 0]
@@ -154,6 +186,8 @@ class TransformerModel(nn.Module):
             selected_features = embedded_features.mean(dim=1)
         elif self.select_member == "all":
             selected_features = embedded_features.reshape(batch_size, -1, n_features)
+        elif self.select_member == "feature":
+            selected_features = embedded_features
         else:
             raise ValueError(f"Invalid selection strategy {self.select_member}")
 

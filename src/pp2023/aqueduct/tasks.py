@@ -149,39 +149,12 @@ def rescale_predictions_ensemble(
     prediction: xr.Dataset, statistics: xr.Dataset
 ) -> xr.Dataset:
     t2m = prediction.t2m * statistics.std_obs_t2m + statistics.mean_obs_t2m
-    log_si10 = (
-        prediction.si10 * statistics.log_std_obs_si10 + statistics.log_mean_obs_si10
-    )
-    si10 = np.expm1(log_si10)
 
-    return xr.Dataset({"t2m": t2m, "si10": si10})
-
-
-def rescale_predictions(prediction: xr.Dataset, statistics: xr.Dataset) -> xr.Dataset:
-    t2m_std = prediction.t2m.sel(parameter="std") * statistics.std_t2m
-    t2m_mean = (
-        prediction.t2m.sel(parameter="mean") * statistics.std_t2m + statistics.mean_t2m
-    )
-    t2m = xr.concat([t2m_mean, t2m_std], dim="parameter")
-
-    t2m = prediction.t2m * statistics.std_t2m + statistics.mean_t2m
-
-    si10 = prediction.si10 * statistics.si10_log_std + statistics.si10_log_mean
-
-    si10_mean_from_model = prediction.si10.sel(parameter="mean")
-    si10_std_from_model = prediction.si10.sel(parameter="std")
-
-    si10_log_mean = (
-        si10_mean_from_model * statistics.log_std_si10 + statistics.log_mean_si10
-    )
-    si10_log_std = si10_std_from_model * statistics.log_std_si10
-
-    si10_std = (si10_log_std / (si10_log_mean)).assign_coords(parameter="std")
-    si10_mean = (np.exp(si10_log_mean + 0.5 * (si10_std) ** 2) - 1).assign_coords(
-        parameter="mean"
-    )
-
-    si10 = xr.concat([si10_mean, si10_std], dim="parameter")
+    # Unnecessary since we changed the wind rescale strategy to log only
+    # log_si10 = (
+    #     prediction.si10 * statistics.log_std_obs_si10 + statistics.log_mean_obs_si10
+    # )
+    si10 = np.clip(np.expm1(prediction.si10), a_min=0.0, a_max=None)
 
     return xr.Dataset({"t2m": t2m, "si10": si10})
 
@@ -192,10 +165,12 @@ class ModelPredictions(aq.Task):
         station_set: str,
         model_name: Optional[str] = None,
         run_id: Optional[str] = None,
+        overrides: Optional[list[str]] = None,
     ):
         self.model_name = model_name
         self.run_id = run_id
         self.station_set = station_set
+        self.overrides = overrides
 
     def requirements(self):
         return RescaleStatistics(self.station_set)
@@ -208,11 +183,16 @@ class ModelPredictions(aq.Task):
             if self.model_name
             else self.run_id
         )
-        # predictions = make_prediction(run_id)
-        predictions = predict(run_id)
+
+        self.run_id = run_id
+
+        predictions = predict(run_id, overrides=self.overrides)
         predictions_xr = interpret_predictions(predictions, rescale_statistics.station)
         rescaled_predictions = rescale_predictions_ensemble(
             predictions_xr, rescale_statistics
         )
 
         return rescaled_predictions
+
+    def artifact(self):
+        return aq.LocalStoreArtifact(f"eddie/pp2023/predictions/{self.run_id}.nc")
