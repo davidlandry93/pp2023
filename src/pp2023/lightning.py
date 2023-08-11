@@ -43,9 +43,6 @@ class PP2023Module(pl.LightningModule):
         optimizer=None,
         scheduler=None,
         scheduler_interval="epoch",
-        train_dataloader=None,
-        val_dataloader=None,
-        test_dataloader=None,
     ):
         super().__init__()
         self.model = model
@@ -56,10 +53,11 @@ class PP2023Module(pl.LightningModule):
 
         self.min_crps = float("inf")
         self.validation_step_crpss = []
+        self.validation_step_t2m_crpss = []
+        self.validation_step_si10_crpss = []
         self.validation_step_counts = []
 
     def forward(self, batch):
-        print("forward")
         new_batch = {}
         for k in batch:
             if batch[k].dtype == torch.double:
@@ -67,7 +65,6 @@ class PP2023Module(pl.LightningModule):
             else:
                 new_batch[k] = batch[k]
 
-        print("calling model")
         return self.model(new_batch)
 
     def make_missing_obs_mask(self, batch):
@@ -96,7 +93,6 @@ class PP2023Module(pl.LightningModule):
         log_step=False,
         logging_prefix="Train",
     ):
-        print("Compute loss", os.getenv("LOCAL_RANK"))
         loss = predicted_distribution.loss(target)
         mean_loss = loss.mean()
 
@@ -106,7 +102,6 @@ class PP2023Module(pl.LightningModule):
                 mean_loss,
                 on_step=True,
                 on_epoch=False,
-                prog_bar=True,
                 rank_zero_only=True,
             )
 
@@ -114,22 +109,8 @@ class PP2023Module(pl.LightningModule):
             f"{logging_prefix}/Loss/All",
             mean_loss,
             on_epoch=True,
-            prog_bar=True,
             sync_dist=True,
         )
-
-        # self.log(
-        #     f"{logging_prefix}/Loss/t2m",
-        #     loss[..., 0].mean(),
-        #     on_epoch=True,
-        #     sync_dist=True,
-        # )
-        # self.log(
-        #     f"{logging_prefix}/Loss/si10",
-        #     loss[..., 1].mean(),
-        #     on_epoch=True,
-        #     sync_dist=True,
-        # )
 
         return mean_loss
 
@@ -139,49 +120,28 @@ class PP2023Module(pl.LightningModule):
         target,
         log_epoch=True,
         prefix="Train",
+        aggregate_per_variable=False,
     ):
-        print("Log CRPS", os.getenv("LOCAL_RANK"))
         crpss = predicted_distribution.crps(target)
 
-        print("Calling Log CRPS", os.getenv("LOCAL_RANK"))
         self.log(
             f"{prefix}/CRPS/All",
             crpss.mean(),
             on_epoch=log_epoch,
-            prog_bar=True,
             sync_dist=True,
         )
-        print("Done Calling Log CRPS", os.getenv("LOCAL_RANK"))
-        # self.log(
-        #     f"{prefix}/CRPS/t2m",
-        #     crpss[..., 0].mean(),
-        #     on_epoch=log_epoch,
-        #     sync_dist=True,
-        # )
-        # self.log(
-        #     f"{prefix}/CRPS/si10",
-        #     crpss[..., 1].mean(),
-        #     on_epoch=log_epoch,
-        #     sync_dist=True,
-        # )
+
+        if aggregate_per_variable:
+            self.validation_step_t2m_crpss.append(crpss[..., 0].mean())
+            self.validation_step_si10_crpss.append(crpss[..., 1].mean())
 
         return crpss.mean()
 
-    def on_before_backward(self, loss: Tensor) -> None:
-        print("Before backward", os.getenv("LOCAL_RANK"))
+    def training_step(self, batch, batch_idx):
+        if self.trainer.is_global_zero:
+            if batch_idx % 20 == 0:
+                print(".", end="", flush=True)
 
-    def on_before_optimizer_step(self, optimizer: Optimizer) -> None:
-        print("Before optimizer step", os.getenv("LOCAL_RANK"))
-
-    def on_train_epoch_start(self) -> None:
-        print("On train epoch start", os.getenv("LOCAL_RANK"))
-
-    def optimizer_step(self, *args, **kwargs) -> None:
-        print("After optimizer step", os.getenv("LOCAL_RANK"))
-        return super().optimizer_step(*args, **kwargs)
-
-    def training_step(self, batch):
-        print("Training step", os.getenv("LOCAL_RANK"))
         mask = self.make_missing_obs_mask(batch)
         masked_target = batch["target"][mask]
         predicted_distribution = self.make_prediction(batch, mask)
@@ -189,12 +149,14 @@ class PP2023Module(pl.LightningModule):
         loss = self.compute_loss(predicted_distribution, masked_target, log_step=False)
 
         self.log_crps(predicted_distribution, masked_target)
-        print("After log_crps", os.getenv("LOCAL_RANK"))
 
         return loss
 
+    def on_validation_start(self) -> None:
+        if self.trainer.is_global_zero:
+            print("Validating...")
+
     def validation_step(self, batch, batch_idx):
-        print("Val step", os.getenv("LOCAL_RANK"))
         mask = self.make_missing_obs_mask(batch)
         masked_target = batch["target"][mask]
         predicted_distribution = self.make_prediction(batch, mask)
@@ -203,13 +165,17 @@ class PP2023Module(pl.LightningModule):
             predicted_distribution, masked_target, logging_prefix="Val"
         )
 
-        crps = self.log_crps(predicted_distribution, masked_target, prefix="Val")
+        crps = self.log_crps(
+            predicted_distribution,
+            masked_target,
+            prefix="Val",
+            aggregate_per_variable=True,
+        )
 
         self.validation_step_crpss.append(crps.mean().detach())
         self.validation_step_counts.append(mask.sum().detach())
 
     def on_train_epoch_end(self) -> None:
-        print("Train epoch end", os.getenv("LOCAL_RANK"))
         self.validation_step_counts = []
         self.validation_step_crpss = []
 
@@ -232,37 +198,46 @@ class PP2023Module(pl.LightningModule):
         }
 
     def on_train_epoch_end(self) -> None:
-        print("Train batch end", os.getenv("LOCAL_RANK"))
         gathered_crps = self.all_gather(self.validation_step_crpss)
+        gathered_t2m_crps = self.all_gather(self.validation_step_t2m_crpss)
+        gathered_si10_crps = self.all_gather(self.validation_step_si10_crpss)
         gathered_counts = self.all_gather(self.validation_step_counts)
 
-        print("GATHERED BEFORE CAT", gathered_crps)
-
         gathered_crps_pt = torch.stack(gathered_crps)
+        gathered_crps_t2m_pt = torch.stack(gathered_t2m_crps)
+        gathered_crps_si10_pt = torch.stack(gathered_si10_crps)
         gathered_counts_pt = torch.stack(gathered_counts)
-
-        print("GATHERED", os.getenv("LOCAL_RANK"), gathered_crps_pt.shape)
-        print("GATHERED", os.getenv("LOCAL_RANK"), gathered_crps_pt)
-        print("GATHERED_COUNTS", os.getenv("LOCAL_RANK"), gathered_counts_pt)
 
         pytorch_crps_epoch = (
             gathered_counts_pt * gathered_crps_pt
         ).sum() / gathered_counts_pt.sum()
 
-        print("pytorch_crps", os.getenv("LOCAL_RANK"), pytorch_crps_epoch)
+        pytorch_t2m_epoch = (
+            gathered_counts_pt * gathered_crps_t2m_pt
+        ).sum() / gathered_counts_pt.sum()
+
+        pytorch_si10_epoch = (
+            gathered_counts_pt * gathered_crps_si10_pt
+        ).sum() / gathered_counts_pt.sum()
+
+        self.log("Val/CRPS/t2m", pytorch_t2m_epoch, rank_zero_only=True)
+        self.log("Val/CRPS/si10", pytorch_si10_epoch, rank_zero_only=True)
 
         if (pytorch_crps_epoch < self.min_crps).item():
             self.log("min_crps", pytorch_crps_epoch, rank_zero_only=True)
             self.min_crps = pytorch_crps_epoch
 
+    def on_train_epoch_start(self) -> None:
+        if self.trainer.is_global_zero:
+            print(f"Epoch: {self.current_epoch}")
         self.validation_step_crpss = []
         self.validation_step_counts = []
+        self.validation_step_t2m_crpss = []
+        self.validation_step_si10_crpss = []
 
     def on_test_epoch_end(self) -> None:
         test_loss = self.test_loss.compute()
-        self.log(
-            "Test/Loss/All", test_loss, on_epoch=True, prog_bar=True, sync_dist=True
-        )
+        self.log("Test/Loss/All", test_loss, on_epoch=True, sync_dist=True)
         self.test_loss.reset()
 
     def configure_optimizers(self):

@@ -30,15 +30,14 @@ class CheckpointArtifactCallback(Callback):
     def on_train_epoch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule
     ) -> None:
-        print("On train epoch end checkpoint callback", os.getenv("LOCAL_RANK"))
-        if trainer.is_global_zero:
-            if (
-                self.best_checkpoint_callback.best_model_path
-                and self.best_checkpoint_callback.best_model_path != self.previous_best
-            ):
-                logger.debug("Logging new best chestkpoint to MLFlow")
-                self.previous_best = self.best_checkpoint_callback.best_model_path
+        if (
+            self.best_checkpoint_callback.best_model_path
+            and self.best_checkpoint_callback.best_model_path != self.previous_best
+        ):
+            logger.debug("Logging new best chestkpoint to MLFlow")
+            self.previous_best = self.best_checkpoint_callback.best_model_path
 
+            if trainer.is_global_zero:
                 if os.path.islink("best_checkpoint.ckpt"):
                     os.unlink("best_checkpoint.ckpt")
 
@@ -46,16 +45,51 @@ class CheckpointArtifactCallback(Callback):
                     self.best_checkpoint_callback.best_model_path,
                     "best_checkpoint.ckpt",
                 )
+
                 mlflow.log_artifact("best_checkpoint.ckpt")
 
 
-@hydra.main(config_path="../conf", config_name="train", version_base="1.3")
-def train_cli(cfg):
+def start_mlflow_run(cfg):
+    mlflow_client = mlflow.MlflowClient()
+    experiments = mlflow_client.search_experiments()
+    experiments = [ex for ex in experiments if ex.name == cfg.mlflow.experiment_name]
+
+    if len(experiments) == 0:
+        logger.info("Experiment not found. Creating it.")
+        experiment_id = mlflow_client.create_experiment(name=cfg.mlflow.experiment_name)
+    else:
+        logger.info("Found experiment.")
+        [experiment] = experiments
+        experiment_id = experiment.experiment_id
+
+    tags = {
+        "cwd": os.getcwd(),
+        "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
+        "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID", ""),
+        "slurm_array_task_id": os.getenv("SLUM_ARRAY_TASK_ID", ""),
+        "launcher": cfg.mlflow.launcher,
+    }
+
+    mlflow_run = mlflow.start_run(
+        experiment_id=experiment_id,
+        tags=tags,
+        run_name=cfg.mlflow.run_name,
+    )
+
+    return mlflow_run
+
+
+def is_main_process():
     node_rank = os.getenv("NODE_RANK", None)
     local_rank = os.getenv("LOCAL_RANK", None)
 
     is_main_process = node_rank is None or (node_rank == 0 and local_rank == 0)
 
+    return is_main_process
+
+
+@hydra.main(config_path="../conf", config_name="train", version_base="1.3")
+def train_cli(cfg):
     logger.info(f"Working from: {os.getcwd()}")
     if "pre" in cfg and cfg["pre"] is not None:
         for k in cfg["pre"]:
@@ -73,47 +107,15 @@ def train_cli(cfg):
 
     torch.manual_seed(cfg.seed)
 
-    if is_main_process:
-        mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
-        mlflow_client = mlflow.MlflowClient()
-        experiments = mlflow_client.search_experiments()
-        experiments = [
-            ex for ex in experiments if ex.name == cfg.mlflow.experiment_name
-        ]
-
-        if len(experiments) == 0:
-            print("Experiment not found. Creating it.")
-            experiment_id = mlflow_client.create_experiment(
-                name=cfg.mlflow.experiment_name
-            )
-        else:
-            print("Found experiment.")
-            [experiment] = experiments
-            experiment_id = experiment.experiment_id
-
-        tags = {
-            "cwd": os.getcwd(),
-            "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
-            "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID", ""),
-            "slurm_array_task_id": os.getenv("SLUM_ARRAY_TASK_ID", ""),
-        }
-
-        print("Starting run")
-        print("Node rank, local rank: ", node_rank, local_rank)
-        mlflow_run = mlflow.start_run(
-            experiment_id=experiment_id,
-            tags=tags,
-            run_name=cfg.mlflow.run_name,
-        )
-        print("Done starting run")
+    mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
+    if is_main_process():
         mlflow_logger = pytorch_lightning.loggers.mlflow.MLFlowLogger(
             experiment_name=cfg.mlflow.experiment_name,
             tracking_uri=cfg.mlflow.tracking_uri,
-            run_id=mlflow_run.info.run_id,
+            run_name=cfg.mlflow.run_name,
             artifact_location=cfg.mlflow.artifact_location,
         )
     else:
-        mlflow_run = None
         mlflow_logger = None
 
     best_checkpoint_callback = ModelCheckpoint(
@@ -121,6 +123,7 @@ def train_cli(cfg):
         monitor="Val/CRPS/All",
         auto_insert_metric_name=False,
         save_last=True,
+        filename="best_checkpoint.ckpt",
     )
     callbacks = [
         LogHyperparametersCallback(cfg.ex),
@@ -140,6 +143,7 @@ def train_cli(cfg):
         logger=mlflow_logger,
         max_epochs=cfg.ex.get("max_epochs", None),
         callbacks=callbacks,
+        enable_progress_bar=False,
     )
 
     try:
@@ -163,22 +167,26 @@ def train_cli(cfg):
 
         n_parameters = sum(p.numel() for p in model.parameters())
 
-        if is_main_process:
-            mlflow.set_tag("n_parameters", n_parameters)
+        if is_main_process():
+            mlflow_logger.experiment.set_tag(
+                mlflow_logger.run_id, "n_parameters", n_parameters
+            )
+            # mlflow.set_tag("n_parameters", n_parameters)
             os.symlink(".hydra", "hydra")
+            _ = mlflow.start_run(run_id=mlflow_logger.run_id)
             mlflow.log_artifact("hydra")
 
         trainer.fit(lightning_module, datamodule=datamodule)
 
-        if is_main_process:
+        if is_main_process():
             if trainer.state.status == "finished" and cfg.mlflow.save_model:
                 if "model_name" in cfg.mlflow and cfg.mlflow.model_name:
                     mlflow.register_model(
-                        f"runs:/{mlflow_run.info.run_id}", cfg.mlflow.model_name
+                        f"runs:/{mlflow_logger.run_id}", cfg.mlflow.model_name
                     )
 
             mlflow.log_artifact("last.ckpt")
     finally:
-        if is_main_process:
+        if is_main_process():
             status = "FINISHED" if trainer.state.status == "finished" else "FAILED"
-            mlflow.end_run(status)
+            mlflow_logger.experiment.set_terminated(mlflow_logger.run_id, status=status)

@@ -4,3 +4,4 @@ tracking_uri: ${oc.env:MLFLOW_TRACKING_URI}
 model_name: ${ex.dataset.station_subset}_${hydra:runtime.choices.ex/model}_${hydra:runtime.choices.ex/distribution}
 save_model: true
 artifact_location:
+launcher: ${hydra:runtime.choices.hydra/launcher}

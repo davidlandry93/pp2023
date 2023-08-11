@@ -131,8 +131,6 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
         n_workers = n_workers_per_node * world_size
         per_worker = int(math.ceil(len(self.input_dataset) / float(n_workers)))
 
-        print("LOCAL_RANK", local_rank, "WORLD_SIZE", world_size)
-
         worker_id = local_rank * n_workers_per_node + worker_id
 
         iter_start = worker_id * per_worker
@@ -142,8 +140,6 @@ class AbstractIterStepDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         iter_start, iter_end = self.get_worker_bounds()
-
-        print(f"Worker bounds: {iter_start} to {iter_end}")
 
         inner_idx = torch.tensor(list(range(iter_start, iter_end)))
         if self.shuffle_inner:

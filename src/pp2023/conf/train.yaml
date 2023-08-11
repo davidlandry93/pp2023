@@ -13,7 +13,7 @@ hydra:
     chdir: True
 
 
-num_workers: ${oc.decode:${oc.env:SLURM_CPUS_PER_TASK,4}}
+num_workers: 6
 
 pre: # Dict of preprocessing external commands, empty for now.
 
