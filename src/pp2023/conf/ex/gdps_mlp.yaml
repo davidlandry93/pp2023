@@ -8,16 +8,16 @@ defaults:
 
 timeout_min: 1200
 
-batch_size:
+batch_size:  # Use prebatched dataset.
 max_epochs: 2000 
 log_every_n_steps: 100
 early_stopping_patience: 800
 
 distribution:
-  n_parameters: 32
+  n_parameters: 16
 
 scheduler:
   instance:
-    max_lr: 2e-3
-    pct_start: 0.15
+    max_lr: 1e-3
+    pct_start: 0.05
     final_div_factor: 100

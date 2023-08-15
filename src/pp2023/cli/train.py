@@ -49,6 +49,15 @@ class CheckpointArtifactCallback(Callback):
                 mlflow.log_artifact("best_checkpoint.ckpt")
 
 
+def make_tags():
+    return {
+        "cwd": os.getcwd(),
+        "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
+        "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID", ""),
+        "slurm_array_task_id": os.getenv("SLUM_ARRAY_TASK_ID", ""),
+    }
+
+
 def start_mlflow_run(cfg):
     mlflow_client = mlflow.MlflowClient()
     experiments = mlflow_client.search_experiments()
@@ -62,13 +71,7 @@ def start_mlflow_run(cfg):
         [experiment] = experiments
         experiment_id = experiment.experiment_id
 
-    tags = {
-        "cwd": os.getcwd(),
-        "slurm_job_id": os.getenv("SLURM_JOB_ID", ""),
-        "slurm_array_job_id": os.getenv("SLURM_ARRAY_JOB_ID", ""),
-        "slurm_array_task_id": os.getenv("SLUM_ARRAY_TASK_ID", ""),
-        "launcher": cfg.mlflow.launcher,
-    }
+    tags = make_tags()
 
     mlflow_run = mlflow.start_run(
         experiment_id=experiment_id,
@@ -168,12 +171,12 @@ def train_cli(cfg):
         n_parameters = sum(p.numel() for p in model.parameters())
 
         if is_main_process():
-            mlflow_logger.experiment.set_tag(
-                mlflow_logger.run_id, "n_parameters", n_parameters
-            )
-            # mlflow.set_tag("n_parameters", n_parameters)
-            os.symlink(".hydra", "hydra")
             _ = mlflow.start_run(run_id=mlflow_logger.run_id)
+
+            tags = {"n_parameters": n_parameters, **make_tags()}
+            mlflow.set_tags(mlflow_logger.run_id, tags)
+
+            os.symlink(".hydra", "hydra")
             mlflow.log_artifact("hydra")
 
         trainer.fit(lightning_module, datamodule=datamodule)

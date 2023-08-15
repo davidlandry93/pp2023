@@ -16,6 +16,7 @@ import aqueduct as aq
 
 from eddie.robust2023 import StationList
 from eddie.ens10_metar.tasks import RescaleStatistics, rescale_strategy_of_var
+from eddie.pp2023.smc01 import SMC01_RescaleStatistics
 
 from ..cli.base import build_model_from_config, build_dataloaders_from_config
 
@@ -60,35 +61,34 @@ def get_artifact_path_from_run_id(run_id: str) -> pathlib.Path:
 def interpret_tensor_for_variable(
     tensor: np.array, forecast_time: np.array, step_idx: np.array
 ) -> xr.DataArray:
-    tensor_xr = (
-        xr.DataArray(
-            tensor,
-            dims=["batch", "station", "parameter"],
-            coords={
-                "batch": pd.MultiIndex.from_arrays(
-                    (forecast_time, step_idx), names=("forecast_time", "step")
-                ),
-            },
-        )
-        .unstack("batch")
-        .assign_coords(step=[pd.to_timedelta(x, unit="days") for x in range(3)])
-    )
+    breakpoint()
+    tensor_xr = xr.DataArray(
+        tensor,
+        dims=["batch", "station", "parameter"],
+        coords={
+            "batch": pd.MultiIndex.from_arrays(
+                (forecast_time, step_idx), names=("forecast_time", "step")
+            ),
+        },
+    ).unstack("batch")
 
     return tensor_xr
 
 
 def interpret_predictions(
-    predictions: list[dict[str, torch.Tensor]], stations: xr.DataArray
+    predictions: list[dict[str, torch.Tensor]],
+    stations: xr.DataArray,
+    step_coord=[pd.to_timedelta(x, unit="days") for x in range(3)],
 ) -> xr.Dataset:
     forecast_time = predictions["forecast_time"].numpy().astype("datetime64[ns]")
     step_idx = predictions["step_idx"].numpy()
 
     t2m = interpret_tensor_for_variable(
         predictions["prediction"][:, :, 0], forecast_time, step_idx
-    )
+    ).assign_coords(step=step_coord)
     si10 = interpret_tensor_for_variable(
         predictions["prediction"][:, :, 1], forecast_time, step_idx
-    )
+    ).assign_coords(step=step_coord)
 
     return (
         xr.Dataset({"t2m": t2m, "si10": si10})
@@ -171,6 +171,7 @@ class ModelPredictions(aq.Task):
         self.run_id = run_id
         self.station_set = station_set
         self.overrides = overrides
+        self.step_coord = [pd.to_timedelta(x, unit="days") for x in range(3)]
 
     def requirements(self):
         return RescaleStatistics(self.station_set)
@@ -187,7 +188,9 @@ class ModelPredictions(aq.Task):
         self.run_id = run_id
 
         predictions = predict(run_id, overrides=self.overrides)
-        predictions_xr = interpret_predictions(predictions, rescale_statistics.station)
+        predictions_xr = interpret_predictions(
+            predictions, rescale_statistics.station, step_coord=self.step_coord
+        )
         rescaled_predictions = rescale_predictions_ensemble(
             predictions_xr, rescale_statistics
         )
@@ -196,3 +199,19 @@ class ModelPredictions(aq.Task):
 
     def artifact(self):
         return aq.LocalStoreArtifact(f"eddie/pp2023/predictions/{self.run_id}.nc")
+
+
+class SMC01_ModelPredictions(ModelPredictions):
+    def __init__(
+        self,
+        model_name: Optional[str] = None,
+        run_id: Optional[str] = None,
+        overrides: Optional[list[str]] = None,
+    ):
+        self.model_name = model_name
+        self.run_id = run_id
+        self.overrides = overrides
+        self.step_coord = [pd.to_timedelta(x, unit="days") for x in range(11)]
+
+    def requirements(self):
+        return SMC01_RescaleStatistics()

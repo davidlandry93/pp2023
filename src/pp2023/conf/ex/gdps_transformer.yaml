@@ -8,8 +8,8 @@ defaults:
 
 timeout_min: 1200
 
-batch_size:
-max_epochs: 2000 
+batch_size:  # Use prebatched dataset.
+max_epochs: 300  # Maximum reliable with 4 GPUs and 20hrs
 log_every_n_steps: 100
 early_stopping_patience: 800
 
@@ -17,10 +17,10 @@ early_stopping_patience: 800
 #   lr: 1e-3
 
 distribution:
-  n_parameters: 32
+  n_parameters: 16
 
 scheduler:
   instance:
-    max_lr: 5e-4
-    pct_start: 0.15
+    max_lr: 1e-3
+    pct_start: 0.05
     final_div_factor: 100
