@@ -150,7 +150,8 @@ def train_cli(cfg):
     )
 
     try:
-        steps_per_epoch = cfg.ex.dataset.train_length
+        datamodule = FromConfigDataModule(cfg)
+        steps_per_epoch = len(datamodule.train_dataloader())
 
         model = build_model_from_config(cfg)
         distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
@@ -166,15 +167,17 @@ def train_cli(cfg):
             scheduler_interval=cfg.ex.scheduler.interval,
         )
 
-        datamodule = FromConfigDataModule(cfg)
-
         n_parameters = sum(p.numel() for p in model.parameters())
 
         if is_main_process():
             _ = mlflow.start_run(run_id=mlflow_logger.run_id)
 
-            tags = {"n_parameters": n_parameters, **make_tags()}
-            mlflow.set_tags(mlflow_logger.run_id, tags)
+            tags = {
+                "n_parameters": n_parameters,
+                "launcher": cfg.mlflow.get("launcher", None),
+                **make_tags(),
+            }
+            mlflow.set_tags(tags)
 
             os.symlink(".hydra", "hydra")
             mlflow.log_artifact("hydra")

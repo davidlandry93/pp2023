@@ -3,6 +3,7 @@ from typing import Optional
 import hydra
 import mlflow
 import numpy as np
+import omegaconf as oc
 import os
 import pandas as pd
 import pathlib
@@ -12,15 +13,89 @@ import urllib.parse
 import xarray as xr
 import yaml
 
+import pytorch_lightning as pl
+
 import aqueduct as aq
 
 from eddie.robust2023 import StationList
 from eddie.ens10_metar.tasks import RescaleStatistics, rescale_strategy_of_var
 from eddie.pp2023.smc01 import SMC01_RescaleStatistics
 
+from ..lightning import PP2023Module
 from ..cli.base import build_model_from_config, build_dataloaders_from_config
 
-from ..cli.predict import predict
+
+def artifact_path_of_run(run_id: str, mlflow_tracking_uri=None) -> pathlib.Path:
+    client = mlflow.MlflowClient(mlflow_tracking_uri)
+    mlflow_run = client.get_run(run_id)
+
+    artifact_uri = mlflow_run.info.artifact_uri
+    parsed_uri = urllib.parse.urlparse(artifact_uri)
+
+    if parsed_uri.scheme == "file":
+        artifact_path = pathlib.Path(parsed_uri.path)
+    else:
+        artifact_path = pathlib.Path(artifact_uri)
+
+    return artifact_path
+
+
+def load_cfg_from_run(artifact_path: pathlib.Path, overrides=None) -> oc.DictConfig:
+    overrides_file = artifact_path / "hydra" / "overrides.yaml"
+    with overrides_file.open() as f:
+        run_overrides = yaml.safe_load(f)
+
+    if overrides is None:
+        overrides = []
+
+    merged_overrides = [*run_overrides, "ex.dataset.maker.cache=False", *overrides]
+    print(merged_overrides)
+
+    with hydra.initialize_config_module("pp2023.conf", version_base="1.3"):
+        cfg = hydra.compose("train", merged_overrides)
+
+    print(cfg)
+
+    return cfg
+
+
+def get_model_from_id(run_id, mlflow_tracking_uri=None, overrides=None):
+    artifact_path = artifact_path_of_run(
+        run_id, mlflow_tracking_uri=mlflow_tracking_uri
+    )
+    cfg = load_cfg_from_run(artifact_path, overrides=overrides)
+
+    model = build_model_from_config(cfg)
+    distribution_strategy = hydra.utils.instantiate(cfg.ex.distribution.strategy)
+    module = PP2023Module.load_from_checkpoint(
+        artifact_path / "best_checkpoint.ckpt",
+        model=model,
+        distribution_strategy=distribution_strategy,
+        map_location="cpu",
+    )
+
+    return cfg, module
+
+
+def predict(run_id, mlflow_tracking_uri=None, test_set=False, overrides=None):
+    cfg, module = get_model_from_id(
+        run_id, mlflow_tracking_uri=mlflow_tracking_uri, overrides=overrides
+    )
+
+    _, val_loader, test_loader = build_dataloaders_from_config(cfg)
+    dataloader = test_loader if test_set else val_loader
+
+    trainer = pl.Trainer(
+        accelerator="auto",
+    )
+
+    predictions = trainer.predict(module, dataloader, return_predictions=True)
+
+    to_return = {}
+    for k in predictions[0]:
+        to_return[k] = torch.cat([p[k] for p in predictions]).cpu()
+
+    return to_return
 
 
 def get_run_id_from_model_name(model_name: str) -> str:
@@ -61,7 +136,6 @@ def get_artifact_path_from_run_id(run_id: str) -> pathlib.Path:
 def interpret_tensor_for_variable(
     tensor: np.array, forecast_time: np.array, step_idx: np.array
 ) -> xr.DataArray:
-    breakpoint()
     tensor_xr = xr.DataArray(
         tensor,
         dims=["batch", "station", "parameter"],
@@ -78,17 +152,17 @@ def interpret_tensor_for_variable(
 def interpret_predictions(
     predictions: list[dict[str, torch.Tensor]],
     stations: xr.DataArray,
-    step_coord=[pd.to_timedelta(x, unit="days") for x in range(3)],
 ) -> xr.Dataset:
     forecast_time = predictions["forecast_time"].numpy().astype("datetime64[ns]")
-    step_idx = predictions["step_idx"].numpy()
 
+    step_coord_np = predictions["step_ns"].numpy().astype("timedelta64[ns]")
     t2m = interpret_tensor_for_variable(
-        predictions["prediction"][:, :, 0], forecast_time, step_idx
-    ).assign_coords(step=step_coord)
+        predictions["prediction"][:, :, 0], forecast_time, step_coord_np
+    )
+
     si10 = interpret_tensor_for_variable(
-        predictions["prediction"][:, :, 1], forecast_time, step_idx
-    ).assign_coords(step=step_coord)
+        predictions["prediction"][:, :, 1], forecast_time, step_coord_np
+    )
 
     return (
         xr.Dataset({"t2m": t2m, "si10": si10})
@@ -139,6 +213,7 @@ def make_prediction(
                 "forecast_time": b["forecast_time"],
                 "model_predictions": pred,
                 "step_idx": b["step_idx"],
+                "step_ns": b["step_ns"],
             }
         )
 
@@ -188,9 +263,7 @@ class ModelPredictions(aq.Task):
         self.run_id = run_id
 
         predictions = predict(run_id, overrides=self.overrides)
-        predictions_xr = interpret_predictions(
-            predictions, rescale_statistics.station, step_coord=self.step_coord
-        )
+        predictions_xr = interpret_predictions(predictions, rescale_statistics.station)
         rescaled_predictions = rescale_predictions_ensemble(
             predictions_xr, rescale_statistics
         )
@@ -198,7 +271,7 @@ class ModelPredictions(aq.Task):
         return rescaled_predictions
 
     def artifact(self):
-        return aq.LocalStoreArtifact(f"eddie/pp2023/predictions/{self.run_id}.nc")
+        return aq.LocalStoreArtifact(f"pp2023/predictions/{self.run_id}.nc")
 
 
 class SMC01_ModelPredictions(ModelPredictions):
@@ -211,7 +284,7 @@ class SMC01_ModelPredictions(ModelPredictions):
         self.model_name = model_name
         self.run_id = run_id
         self.overrides = overrides
-        self.step_coord = [pd.to_timedelta(x, unit="days") for x in range(11)]
+        self.step_coord = [pd.to_timedelta(3 * x, unit="hours") for x in range(81)]
 
     def requirements(self):
         return SMC01_RescaleStatistics()

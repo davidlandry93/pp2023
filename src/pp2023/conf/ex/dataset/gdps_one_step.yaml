@@ -1,12 +1,12 @@
-n_steps: 81
+n_steps: 1
 n_stations: 1189
 n_members: 1
 n_features: 20
 station_subset: gdps
 n_forecasts: 2
 maker:
-  _target_: pp2023.dataset.make_torch_record_step_datasets
+  _target_: pp2023.dataset.make_one_step_datasets
   input_dir: ${oc.env:EDDIE_LOCAL_STORE}/pp2023/smc01/pt
   limit_features: ${..n_features}
   to_32bits: false
-  cache: false
+  step_idx: 1

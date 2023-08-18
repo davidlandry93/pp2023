@@ -109,7 +109,6 @@ class PP2023Module(pl.LightningModule):
             f"{logging_prefix}/Loss/All",
             mean_loss,
             on_epoch=True,
-            sync_dist=True,
         )
 
         return mean_loss
@@ -194,6 +193,7 @@ class PP2023Module(pl.LightningModule):
         return {
             "forecast_time": batch["forecast_time"],
             "step_idx": batch["step_idx"],
+            "step_ns": batch["step_ns"],
             "prediction": predicted_distribution,
         }
 

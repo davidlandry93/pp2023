@@ -16,6 +16,10 @@ early_stopping_patience: 800
 # optimizer:
 #   lr: 1e-3
 
+model:
+  n_blocks: 3
+  embedding_size: 128
+
 distribution:
   n_parameters: 16
 

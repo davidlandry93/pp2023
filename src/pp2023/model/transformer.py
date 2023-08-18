@@ -110,6 +110,7 @@ class TransformerModel(nn.Module):
         add_meta_tokens=False,
         n_stations=None,
         n_steps=None,
+        n_forecasts=None,
         n_members=10,
         n_time_models=12,
         select_member="first",
@@ -196,9 +197,18 @@ class TransformerModel(nn.Module):
 
         repeat_member = n_members if self.select_member == "all" else 1
         station_id = (
-            torch.arange(n_stations)
+            torch.arange(n_stations, device=batch["features"].device)
             .repeat((batch_size, repeat_member, 1))
             .reshape(batch_size, -1)
+        )
+
+        # If obs are missing, use the empty station embedding.
+        has_no_obs = torch.isnan(batch["target"]).any(dim=-1)
+        torch.where(
+            has_no_obs,
+            torch.tensor(-1, device=has_no_obs.device),
+            station_id,
+            out=station_id,
         )
 
         station_embeddings = self.station_embedding[station_id]

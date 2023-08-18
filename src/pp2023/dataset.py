@@ -203,12 +203,25 @@ class TorchIterStepDataset(AbstractIterStepDataset):
                 "forecast_parameters",
                 "deterministic_forecast",
                 "step_idx",
+                "step_ns",
             ]:
                 to_return[k] = example[k][step, ...]
             else:
                 to_return[k] = example[k]
 
         return to_return
+
+
+class TorchOnlyOneStepDataset(TorchIterStepDataset):
+    def __init__(self, inner, step_idx):
+        super().__init__(inner)
+        self.step_idx = step_idx
+
+    def list_steps(self, example):
+        if self.step_idx in example["step_idx"]:
+            return [self.step_idx]
+        else:
+            return []
 
 
 class CacheDataset:
@@ -248,4 +261,14 @@ def make_torch_record_step_datasets(input_dir, cache=False, **kwargs):
         TorchIterStepDataset(train, shuffle_inner=True, shuffle_steps=True),
         TorchIterStepDataset(val),
         TorchIterStepDataset(test),
+    ]
+
+
+def make_one_step_datasets(input_dir, step_idx, **kwargs):
+    train, val, test = make_torch_record_datasets(input_dir, **kwargs)
+
+    return [
+        TorchOnlyOneStepDataset(train, step_idx),
+        TorchOnlyOneStepDataset(val, step_idx),
+        TorchOnlyOneStepDataset(test, step_idx),
     ]

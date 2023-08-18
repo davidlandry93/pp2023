@@ -1,0 +1,16 @@
+defaults: 
+- submitit_slurm
+
+timeout_min: 6000
+cpus_per_task: 24
+tasks_per_node: 1
+nodes: 1
+# array_parallelism: 12
+gres: gpu:4
+partition: 
+account: ovm@v100
+qos: qos_gpu-t4
+constraint: v100-32g
+setup:
+  - source ${oc.env:HOME}/.bashrc
+  - conda activate eddie

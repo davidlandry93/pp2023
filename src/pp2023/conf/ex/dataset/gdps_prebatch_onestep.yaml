@@ -4,9 +4,10 @@ n_members: 1
 n_features: 20
 station_subset: gdps
 n_forecasts: 2
+step_idx: 24
 maker:
   _target_: pp2023.dataset.make_torch_record_datasets
-  input_dir: ${oc.env:EDDIE_LOCAL_STORE}/pp2023/smc01/prebatch_64
+  input_dir: ${oc.env:EDDIE_LOCAL_STORE}/pp2023/smc01/prebatch_64_step_${..step_idx}
   limit_features: ${..n_features}
   to_32bits: false
   cache: false

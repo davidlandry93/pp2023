@@ -11,10 +11,12 @@ class MLP(nn.Module):
         n_parameters=2,
         n_stations=0,
         n_steps=3,
+        n_forecasts=1,
         n_members=10,
         embedding_size=32,
         n_blocks=4,
         use_member_embedding=True,
+        use_forecast_embedding=False,
         use_step_embedding=True,
         use_station_embedding=True,
         embedding_activation=True,
@@ -55,6 +57,11 @@ class MLP(nn.Module):
             self.step_embedding = nn.Parameter(torch.empty(n_steps, 1, embedding_size))
             torch.nn.init.normal_(self.step_embedding, 0, (1 / n_steps))
 
+        if use_forecast_embedding:
+            self.forecast_embedding = nn.Embedding(
+                n_forecasts, embedding_dim=embedding_size
+            )
+
         blocks = []
         for _ in range(n_blocks):
             blocks.append(nn.Linear(embedding_size, embedding_size))
@@ -91,6 +98,9 @@ class MLP(nn.Module):
 
         if hasattr(self, "step_embedding"):
             pooled_features += self.step_embedding[batch["step_idx"]]
+
+        if hasattr(self, "forecast_embedding"):
+            pooled_features += self.forecast_embedding[batch["forecast_idx"]]
 
         if hasattr(self, "station_embedding"):
             pooled_features += self.station_embedding
