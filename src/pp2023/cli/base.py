@@ -73,7 +73,6 @@ def build_model_from_config(cfg: oc.DictConfig) -> torch.nn.Module:
     model = hydra.utils.instantiate(
         cfg.ex.model,
         in_features=dataset_cfg.n_features,
-        n_variables=2,
         n_parameters=cfg.ex.distribution.n_parameters,
         n_forecasts=dataset_cfg.n_forecasts,
         n_steps=dataset_cfg.n_steps,

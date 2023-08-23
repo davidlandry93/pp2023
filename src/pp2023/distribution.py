@@ -143,15 +143,32 @@ class NormalParametric(DistributionalForecast):
 
 
 class DeterministicStrategy(DistributionalForecastStrategy):
+    def __init__(self, variable_idx=None):
+        """Args:
+        variable_idx: The index of the variable to make distributions for. If None,
+        will train on all the variables jointly."""
+        self.variable_idx = variable_idx
+
     def nwp_base(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        return batch["forecast_parameters"][..., [0]]
+        forecast = batch["forecast"]
+        forecast = forecast.mean(dim=1).unsqueeze(-1)
+
+        if self.variable_idx is not None:
+            forecast = forecast[..., [self.variable_idx], :]
+
+        # Return the mean over the ensemble member dimension.
+        # Unsqueeze the last dimension which is the "parameter" dimension. In the
+        # case of a deterministic forecast, the parameter is 1.
+        return forecast
 
     def from_tensor(self, features: torch.Tensor) -> DistributionalForecast:
-        return DeterministicForecast(features)
+        return DeterministicForecast(features, variable_idx=self.variable_idx)
 
 
 class DeterministicForecast(DistributionalForecast):
-    def __init__(self, params):
+    def __init__(self, params, variable_idx=None):
+        self.variable_idx = variable_idx
+
         t2m, log_si10 = params[..., 0, :], params[..., 1, :]
 
         # Restrain log_si10 to a minimum of zero so that expm1(log_si10) will also be
@@ -159,12 +176,24 @@ class DeterministicForecast(DistributionalForecast):
         log_si10 = torch.clamp(log_si10, min=LOG_SI10_CLAMP)
 
         params = torch.stack([t2m, log_si10], dim=-2)
-        self.preds = params.squeeze()
+
+        if variable_idx is not None:
+            params = params[..., [variable_idx], :]
+
+        self.preds = params.squeeze(-1)
 
     def loss(self, x: torch.Tensor):
+        if self.variable_idx is not None:
+            x = x[..., [self.variable_idx]]
+
         return torch.square(x - self.preds)
 
     def crps(self, x: torch.Tensor):
+        """Args:
+        x: [B, v] tensor where B is the batch dimension and v the variable dimension."""
+        if self.variable_idx is not None:
+            x = x[..., [self.variable_idx]]
+
         return torch.abs(x - self.preds)
 
 

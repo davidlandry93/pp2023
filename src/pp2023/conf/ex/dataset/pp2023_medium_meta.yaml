@@ -1,0 +1,12 @@
+n_steps: 3
+n_stations: 100
+n_members: 10
+n_features: 88
+station_subset: pp2023_medium
+maker:
+  _target_: pp2023.dataset.make_torch_record_step_datasets
+  input_dir: ${oc.env:EDDIE_LOCAL_STORE}/ens10_metar/${..station_subset}/sets/
+  limit_features: ${..n_features}
+  to_32bits: false
+  cache: true
+  use_metadata_features: true

@@ -1,7 +1,7 @@
 defaults:
 - dataset: gdps_prebatch
 - model: linear
-- distribution: normal
+- distribution: deterministic
 - optimizer: adam
 - scheduler: one_cycle
 - _self_

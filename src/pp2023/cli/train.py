@@ -177,6 +177,14 @@ def train_cli(cfg):
                 "launcher": cfg.mlflow.get("launcher", None),
                 **make_tags(),
             }
+
+            if cfg.ex.distribution.strategy.get("variable_idx", None) is not None:
+                """Here I make a note to myself that the number of parameters is
+                invalid if we are targeting a particular variable. If we pick one variable,
+                the number of parameters is too highg because the model still has params
+                to handle all the variables."""
+                del tags["n_parameters"]
+
             mlflow.set_tags(tags)
 
             os.symlink(".hydra", "hydra")

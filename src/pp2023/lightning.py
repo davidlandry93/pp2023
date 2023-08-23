@@ -43,6 +43,7 @@ class PP2023Module(pl.LightningModule):
         optimizer=None,
         scheduler=None,
         scheduler_interval="epoch",
+        variable_idx=None,
     ):
         super().__init__()
         self.model = model
@@ -50,6 +51,7 @@ class PP2023Module(pl.LightningModule):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.scheduler_interval = scheduler_interval
+        self.variable_idx = None
 
         self.min_crps = float("inf")
         self.validation_step_crpss = []
@@ -130,7 +132,9 @@ class PP2023Module(pl.LightningModule):
             sync_dist=True,
         )
 
-        if aggregate_per_variable:
+        # There is an option to target only one variable in the distribution, so
+        # we need to check if the crps actually contains multiple columns.
+        if aggregate_per_variable and crpss.shape[-1] > 1:
             self.validation_step_t2m_crpss.append(crpss[..., 0].mean())
             self.validation_step_si10_crpss.append(crpss[..., 1].mean())
 
@@ -204,28 +208,34 @@ class PP2023Module(pl.LightningModule):
         gathered_counts = self.all_gather(self.validation_step_counts)
 
         gathered_crps_pt = torch.stack(gathered_crps)
-        gathered_crps_t2m_pt = torch.stack(gathered_t2m_crps)
-        gathered_crps_si10_pt = torch.stack(gathered_si10_crps)
         gathered_counts_pt = torch.stack(gathered_counts)
 
         pytorch_crps_epoch = (
             gathered_counts_pt * gathered_crps_pt
         ).sum() / gathered_counts_pt.sum()
 
-        pytorch_t2m_epoch = (
-            gathered_counts_pt * gathered_crps_t2m_pt
-        ).sum() / gathered_counts_pt.sum()
-
-        pytorch_si10_epoch = (
-            gathered_counts_pt * gathered_crps_si10_pt
-        ).sum() / gathered_counts_pt.sum()
-
-        self.log("Val/CRPS/t2m", pytorch_t2m_epoch, rank_zero_only=True)
-        self.log("Val/CRPS/si10", pytorch_si10_epoch, rank_zero_only=True)
+        print(pytorch_crps_epoch.item())
 
         if (pytorch_crps_epoch < self.min_crps).item():
             self.log("min_crps", pytorch_crps_epoch, rank_zero_only=True)
             self.min_crps = pytorch_crps_epoch
+
+        if len(gathered_t2m_crps) > 0:
+            """If gathered_t2m_crps is length 0, it means we did not gather statistics
+            per variable, so don't try to log them."""
+            gathered_crps_t2m_pt = torch.stack(gathered_t2m_crps)
+            gathered_crps_si10_pt = torch.stack(gathered_si10_crps)
+
+            pytorch_t2m_epoch = (
+                gathered_counts_pt * gathered_crps_t2m_pt
+            ).sum() / gathered_counts_pt.sum()
+
+            pytorch_si10_epoch = (
+                gathered_counts_pt * gathered_crps_si10_pt
+            ).sum() / gathered_counts_pt.sum()
+
+            self.log("Val/CRPS/t2m", pytorch_t2m_epoch, rank_zero_only=True)
+            self.log("Val/CRPS/si10", pytorch_si10_epoch, rank_zero_only=True)
 
     def on_train_epoch_start(self) -> None:
         if self.trainer.is_global_zero:

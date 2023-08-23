@@ -1,3 +1,4 @@
 n_parameters: 1
 strategy:
   _target_: pp2023.distribution.DeterministicStrategy
+  variable_idx: 
