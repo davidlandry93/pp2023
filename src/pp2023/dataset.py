@@ -195,15 +195,15 @@ class TorchIterStepDataset(AbstractIterStepDataset):
         to_return = {}
         for k in example:
             if k in [
-                "features",
-                "metadata_features",
-                "target",
-                "forecast",
-                "forecast_sort_idx",
-                "forecast_parameters",
                 "deterministic_forecast",
+                "features",
+                "forecast_parameters",
+                "forecast_sort_idx",
+                "forecast",
+                "metadata_features",
                 "step_idx",
                 "step_ns",
+                "target",
             ]:
                 to_return[k] = example[k][step, ...]
             else:
