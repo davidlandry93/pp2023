@@ -1,22 +1,20 @@
 defaults:
 - dataset: gdps_prebatch_24h
 - model: mlp
-- distribution: quantile
+- distribution: normal
 - optimizer: adam
-- scheduler: one_cycle
+- scheduler: reduce_lr_plateau
 - _self_
 
 timeout_min: 1200
 
 batch_size:  # Use prebatched dataset.
-max_epochs: 2000 
+max_epochs: 300  # Maximum reliable with 4 GPUs and 20hrs
 log_every_n_steps: 100
 early_stopping_patience: 800
 
-variable_idx: 
-
-distribution:
-  n_parameters: 16
+optimizer:
+  lr: 1e-3
 
 scheduler:
   instance:
