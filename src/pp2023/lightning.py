@@ -51,7 +51,7 @@ class PP2023Module(pl.LightningModule):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.scheduler_interval = scheduler_interval
-        self.variable_idx = None
+        self.variable_idx = variable_idx
 
         self.min_crps = float("inf")
         self.validation_step_crpss = []
@@ -72,6 +72,7 @@ class PP2023Module(pl.LightningModule):
     def make_missing_obs_mask(self, batch):
         target = batch["target"]
         mask = ~(torch.isnan(target).any(dim=-1))
+
         return mask
 
     def make_prediction(self, batch, mask):
@@ -147,6 +148,10 @@ class PP2023Module(pl.LightningModule):
 
         mask = self.make_missing_obs_mask(batch)
         masked_target = batch["target"][mask]
+
+        if self.variable_idx:
+            masked_target = masked_target[..., [self.variable_idx]]
+
         predicted_distribution = self.make_prediction(batch, mask)
 
         loss = self.compute_loss(predicted_distribution, masked_target, log_step=False)
@@ -162,6 +167,10 @@ class PP2023Module(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         mask = self.make_missing_obs_mask(batch)
         masked_target = batch["target"][mask]
+
+        if self.variable_idx:
+            masked_target = masked_target[..., [self.variable_idx]]
+
         predicted_distribution = self.make_prediction(batch, mask)
 
         loss = self.compute_loss(

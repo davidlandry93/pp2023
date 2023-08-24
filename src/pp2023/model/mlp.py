@@ -106,7 +106,6 @@ class MLP(nn.Module):
             pooled_features += self.station_embedding
 
         correction = self.mlp(pooled_features)
-
         return correction.reshape(
             *correction.shape[:-1], self.n_variables, self.n_parameters
         )

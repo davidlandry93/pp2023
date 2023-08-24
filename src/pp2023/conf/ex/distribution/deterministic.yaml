@@ -1,4 +1,5 @@
 n_parameters: 1
 strategy:
   _target_: pp2023.distribution.DeterministicStrategy
-  variable_idx: 
+  variable_idx: ${ex.variable_idx}
+  use_base: True 

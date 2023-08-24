@@ -1,3 +1,4 @@
+from typing import Callable
 import math
 import torch
 import torch.distributions as td
@@ -143,11 +144,14 @@ class NormalParametric(DistributionalForecast):
 
 
 class DeterministicStrategy(DistributionalForecastStrategy):
-    def __init__(self, variable_idx=None):
+    def __init__(self, variable_idx=None, use_base=True):
         """Args:
         variable_idx: The index of the variable to make distributions for. If None,
-        will train on all the variables jointly."""
+            will train on all the variables jointly.
+        use_base: Wether to use the NWP forecast as a basis and only predict the
+            residual, or to make our own forecast from scratch."""
         self.variable_idx = variable_idx
+        self.use_base = use_base
 
     def nwp_base(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         forecast = batch["forecast"]
@@ -159,7 +163,11 @@ class DeterministicStrategy(DistributionalForecastStrategy):
         # Return the mean over the ensemble member dimension.
         # Unsqueeze the last dimension which is the "parameter" dimension. In the
         # case of a deterministic forecast, the parameter is 1.
-        return forecast
+        return (
+            forecast
+            if self.use_base
+            else torch.zeros_like(forecast, device=forecast.device)
+        )
 
     def from_tensor(self, features: torch.Tensor) -> DistributionalForecast:
         return DeterministicForecast(features, variable_idx=self.variable_idx)
@@ -263,3 +271,87 @@ class QuantileRegressionStrategy(DistributionalForecastStrategy):
 
     def from_tensor(self, x: torch.Tensor) -> "QuantileRegression":
         return QuantileRegression(x, regularization=self.regularization)
+
+
+class BernsteinQuantileFunctionForecast(DistributionalForecast):
+    def __init__(self, params: torch.Tensor, degree: int, device=None):
+        self.coefficients = params
+        self.degree = degree
+        self.poly = bernstein_polynomial(self.degree, device=params.device)
+        self.n_samples = 100
+
+    def make_quantile_values(self, n_samples, device):
+        quantiles = torch.linspace(0.0, 1.0, n_samples, device=device)
+
+        poly_values = self.poly(quantiles)
+
+        # Estimated value of
+        quantile_values = (poly_values * self.coefficients.unsqueeze(-1)).sum(dim=-2)
+        return quantiles, quantile_values
+
+    def loss(self, x):
+        quantiles, quantile_values = self.make_quantile_values(self.n_samples, x.device)
+
+        x = x.unsqueeze(-1)
+        left_quantile_loss = -1.0 * (quantiles.unsqueeze(0)) * (quantile_values - x)
+        right_quantile_loss = (1 - quantiles.unsqueeze(0)) * (quantile_values - x)
+
+        quantile_loss = torch.where(
+            quantile_values < x, left_quantile_loss, right_quantile_loss
+        )
+
+        return quantile_loss.mean(dim=-1)
+
+    def crps(self, x):
+        _, quantile_values = self.make_quantile_values(self.n_samples, x.device)
+        return crps_empirical(quantile_values, x.unsqueeze(-1))
+
+
+class BernsteinQuantileFunctionStrategy(DistributionalForecastStrategy):
+    def __init__(self, degree: int, use_base=True, variable_idx=None):
+        self.degree = degree
+        self.variable_idx = None
+        self.use_base = use_base
+
+    def nwp_base(self, batch):
+        forecast = batch["forecast"]
+        forecast = forecast.mean(dim=1).unsqueeze(-1)
+
+        if self.variable_idx is not None:
+            forecast = forecast[..., [self.variable_idx], :]
+
+        # Return the mean over the ensemble member dimension.
+        # Unsqueeze the last dimension which is the "parameter" dimension. In the
+        # case of a deterministic forecast, the parameter is 1.
+        return (
+            forecast
+            if self.use_base
+            else torch.zeros_like(forecast, device=forecast.device)
+        )
+
+    def from_tensor(self, x: torch.Tensor):
+        return BernsteinQuantileFunctionForecast(x, degree=self.degree)
+
+
+def binomial(n, k):
+    """https://github.com/pytorch/pytorch/issues/47841"""
+    mask = n.detach() >= k.detach()
+    n = mask * n
+    k = mask * k
+    a = torch.lgamma(n + 1) - torch.lgamma((n - k) + 1) - torch.lgamma(k + 1)
+    return torch.exp(a) * mask
+
+
+def bernstein_polynomial(
+    degree: int, device=None
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    nus = torch.arange(0, degree + 1, device=device).unsqueeze(-1)
+
+    binom_coefs = binomial(torch.tensor(degree), nus)
+    left_exp = nus
+    right_exp = degree - nus
+
+    def poly(x):
+        return binom_coefs * x**left_exp * (1.0 - x) ** right_exp
+
+    return poly

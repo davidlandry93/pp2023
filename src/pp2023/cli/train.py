@@ -165,6 +165,7 @@ def train_cli(cfg):
             optimizer,
             scheduler,
             scheduler_interval=cfg.ex.scheduler.interval,
+            variable_idx=cfg.ex.variable_idx,
         )
 
         n_parameters = sum(p.numel() for p in model.parameters())
