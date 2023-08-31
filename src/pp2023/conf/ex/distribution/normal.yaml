@@ -1,5 +1,5 @@
 n_parameters: 2  # For every forecast, we need 4 parameters to initialize our distributions.
 strategy:
-  _target_: pp2023.distribution.NormalParametricStrategy
+  _target_: pp2023.distribution.base.NormalParametricStrategy
   loss_fn: crps
   variable_idx: 0  # Really doesn't make sense to forecast wind with a Normal.

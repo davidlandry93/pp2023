@@ -1,5 +1,5 @@
 n_parameters: 9 # Should be degree + 1 for Bernstein Polynomial.
 strategy:
-  _target_: pp2023.distribution.BernsteinQuantileFunctionStrategy
+  _target_: pp2023.distribution.base.BernsteinQuantileFunctionStrategy
   n_parameters: ${..n_parameters}
   use_base: True 
