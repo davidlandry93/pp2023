@@ -3,6 +3,7 @@ embedding_size: 64
 n_blocks: 4
 use_station_embedding: true
 use_step_embedding: true
+use_step_feature: true
 use_member_embedding: false
 embedding_activation: true
 use_metadata_features: true

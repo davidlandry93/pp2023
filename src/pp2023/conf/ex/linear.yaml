@@ -1,0 +1,16 @@
+defaults:
+- dataset: gdps_prebatch_24h
+- model: linear
+- distribution: quantile
+- optimizer: adam
+- scheduler: one_cycle
+- _self_
+
+timeout_min: 240
+
+batch_size:  # Use prebatched dataset.
+max_epochs: 2000
+log_every_n_steps: 100
+early_stopping_patience: 800
+
+variable_idx: 

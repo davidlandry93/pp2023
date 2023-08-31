@@ -22,6 +22,7 @@ class TorchRecordDataset:
         to_32bits=False,
         shuffle=False,
         limit=None,
+        n_members=None,
     ):
         self.input_dir = pathlib.Path(input_dir)
         self.files = list(self.input_dir.glob("*.pt"))
@@ -35,6 +36,7 @@ class TorchRecordDataset:
         self.limit_features = limit_features
         self.to_32bits = to_32bits
         self.limit = limit
+        self.n_members = n_members
 
     def __len__(self):
         if self.limit is not None:
@@ -59,6 +61,24 @@ class TorchRecordDataset:
                     new_example[k] = example[k].to(dtype=torch.float32)
                 else:
                     new_example[k] = example[k]
+
+            example = new_example
+
+        if self.n_members is not None:
+            new_example = {}
+            for k in example:
+                if k in (
+                    "forecast",
+                    "features",
+                    "metadata_features",
+                ):
+                    new_example[k] = torch.clone(example[k][:, 0 : self.n_members])
+                else:
+                    new_example[k] = example[k]
+
+            new_example["forecast_sort_idx"] = torch.argsort(
+                new_example["forecast"], dim=1
+            )
 
             example = new_example
 

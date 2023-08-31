@@ -7,7 +7,7 @@ import torch.utils.data
 import subprocess
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 import pytorch_lightning.loggers.mlflow
 from pytorch_lightning.callbacks import (
     LearningRateMonitor,
@@ -22,27 +22,27 @@ from ..lightning import PP2023Module, LogHyperparametersCallback, FromConfigData
 logger = logging.getLogger(__name__)
 
 
-class CheckpointArtifactCallback(Callback):
-    def __init__(self, best_checkpoint_callback):
-        self.best_checkpoint_callback = best_checkpoint_callback
+class CheckpointArtifactCallback(ModelCheckpoint):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.previous_best = None
 
     def on_train_epoch_end(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule
     ) -> None:
-        if (
-            self.best_checkpoint_callback.best_model_path
-            and self.best_checkpoint_callback.best_model_path != self.previous_best
-        ):
-            logger.debug("Logging new best chestkpoint to MLFlow")
-            self.previous_best = self.best_checkpoint_callback.best_model_path
+        logger.info("Saving checkpoint.")
+        super().on_train_epoch_end(trainer, pl_module)
+
+        if self.best_model_path and self.best_model_path != self.previous_best:
+            logger.info("Logging new best checkpoint to MLFlow")
+            self.previous_best = self.best_model_path
 
             if trainer.is_global_zero:
                 if os.path.islink("best_checkpoint.ckpt"):
                     os.unlink("best_checkpoint.ckpt")
 
                 os.symlink(
-                    self.best_checkpoint_callback.best_model_path,
+                    self.best_model_path,
                     "best_checkpoint.ckpt",
                 )
 
@@ -121,12 +121,11 @@ def train_cli(cfg):
     else:
         mlflow_logger = None
 
-    best_checkpoint_callback = ModelCheckpoint(
+    best_checkpoint_callback = CheckpointArtifactCallback(
         dirpath=os.getcwd(),
         monitor="Val/CRPS/All",
         auto_insert_metric_name=False,
         save_last=True,
-        filename="best_checkpoint.ckpt",
     )
     callbacks = [
         LogHyperparametersCallback(cfg.ex),
@@ -137,7 +136,6 @@ def train_cli(cfg):
             patience=cfg.ex.early_stopping_patience,
         ),
         best_checkpoint_callback,
-        CheckpointArtifactCallback(best_checkpoint_callback),
     ]
 
     trainer = pl.Trainer(

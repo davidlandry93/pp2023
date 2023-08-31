@@ -26,15 +26,15 @@ def build_dataloaders_from_config(
         train_sampler = torch.utils.data.DistributedSampler(
             train_dataset,
             shuffle=True,
-            drop_last=True,
+            drop_last=False,
         )
         val_sampler = torch.utils.data.DistributedSampler(
             val_dataset,
-            drop_last=True,
+            drop_last=False,
         )
         test_sampler = torch.utils.data.DistributedSampler(
             test_dataset,
-            drop_last=True,
+            drop_last=False,
         )
     else:
         train_sampler = None
@@ -46,7 +46,7 @@ def build_dataloaders_from_config(
         batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
         sampler=train_sampler,
-        persistent_workers=True,
+        # persistent_workers=True,
     )
 
     val_dataloader = torch.utils.data.DataLoader(
@@ -54,7 +54,7 @@ def build_dataloaders_from_config(
         batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
         sampler=val_sampler,
-        persistent_workers=True,
+        # persistent_workers=True,
     )
 
     test_dataloader = torch.utils.data.DataLoader(
@@ -62,7 +62,7 @@ def build_dataloaders_from_config(
         batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
         sampler=test_sampler,
-        persistent_workers=True,
+        # persistent_workers=True,
     )
 
     return train_dataloader, val_dataloader, test_dataloader

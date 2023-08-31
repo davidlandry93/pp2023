@@ -10,8 +10,8 @@ dependencies = [
     "nc-time-axis",
     "torch",
     "pytorch_lightning",
+    "hydra-submitit-launcher",
 ]
-
 
 
 [project.optional-dependencies]

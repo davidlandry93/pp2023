@@ -13,4 +13,4 @@ qos: ${ex.qos}
 constraint: ${ex.jz_constraint}
 setup:
   - source ${oc.env:HOME}/.bashrc
-  - conda activate eddie
+  - conda activate ${conda_env_name}

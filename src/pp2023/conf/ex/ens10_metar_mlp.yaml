@@ -1,0 +1,27 @@
+defaults:
+- dataset: pp2023_medium
+- model: mlp
+- distribution: quantile
+- optimizer: adam
+- scheduler: one_cycle
+- _self_
+
+timeout_min: 480
+
+batch_size: 64
+max_epochs: 800
+log_every_n_steps: 20
+early_stopping_patience: 100
+
+# optimizer:
+#   lr: 1e-3
+
+dataset:
+  n_features: 88
+
+distribution:
+  n_parameters: 32
+
+scheduler:
+  instance:
+    max_lr: 2e-3

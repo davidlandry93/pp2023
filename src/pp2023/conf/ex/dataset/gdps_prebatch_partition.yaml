@@ -1,16 +1,14 @@
-# GDPS, keep only one step every 24h
-
-n_steps: 11
+n_steps: 1
 n_stations: 1189
 n_members: 1
 n_features: 20
 station_subset: gdps
 n_forecasts: 2
+step_hour_label: 000
 maker:
   _target_: pp2023.dataset.make_torch_record_datasets
-  input_dir: ${oc.env:EDDIE_LOCAL_STORE}/pp2023/smc01/prebatch64_0_12_step24h
+  input_dir: ${oc.env:EDDIE_LOCAL_STORE}/pp2023/smc01/prebatch64_0_12_step3h_only${..step_hour_label}h
   limit_features: ${..n_features}
   to_32bits: false
   cache: false
   limit:
-  n_members: 

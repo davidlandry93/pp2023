@@ -25,10 +25,14 @@ from ..lightning import PP2023Module
 from ..cli.base import build_model_from_config, build_dataloaders_from_config
 
 
-def artifact_path_of_run(run_id: str, mlflow_tracking_uri=None) -> pathlib.Path:
+def get_run_object(run_id: str, mlflow_tracking_uri=None):
     client = mlflow.MlflowClient(mlflow_tracking_uri)
     mlflow_run = client.get_run(run_id)
 
+    return mlflow_run
+
+
+def artifact_path_of_run(mlflow_run) -> pathlib.Path:
     artifact_uri = mlflow_run.info.artifact_uri
     parsed_uri = urllib.parse.urlparse(artifact_uri)
 
@@ -45,6 +49,8 @@ def load_cfg_from_run(artifact_path: pathlib.Path, overrides=None) -> oc.DictCon
     with overrides_file.open() as f:
         run_overrides = yaml.safe_load(f)
 
+    hydra_file = artifact_path / "hydra" / "hydra.yaml"
+
     if overrides is None:
         overrides = []
 
@@ -59,10 +65,8 @@ def load_cfg_from_run(artifact_path: pathlib.Path, overrides=None) -> oc.DictCon
     return cfg
 
 
-def get_model_from_id(run_id, mlflow_tracking_uri=None, overrides=None):
-    artifact_path = artifact_path_of_run(
-        run_id, mlflow_tracking_uri=mlflow_tracking_uri
-    )
+def get_model_from_id(mlflow_run, overrides=None):
+    artifact_path = artifact_path_of_run(mlflow_run)
     cfg = load_cfg_from_run(artifact_path, overrides=overrides)
 
     model = build_model_from_config(cfg)
@@ -78,9 +82,8 @@ def get_model_from_id(run_id, mlflow_tracking_uri=None, overrides=None):
 
 
 def predict(run_id, mlflow_tracking_uri=None, test_set=False, overrides=None):
-    cfg, module = get_model_from_id(
-        run_id, mlflow_tracking_uri=mlflow_tracking_uri, overrides=overrides
-    )
+    mlflow_run = get_run_object(run_id, mlflow_tracking_uri)
+    cfg, module = get_model_from_id(mlflow_run, overrides=overrides)
 
     _, val_loader, test_loader = build_dataloaders_from_config(cfg)
     dataloader = test_loader if test_set else val_loader
@@ -95,7 +98,7 @@ def predict(run_id, mlflow_tracking_uri=None, test_set=False, overrides=None):
     for k in predictions[0]:
         to_return[k] = torch.cat([p[k] for p in predictions]).cpu()
 
-    return to_return
+    return to_return, cfg
 
 
 def get_run_id_from_model_name(model_name: str) -> str:
@@ -234,6 +237,49 @@ def rescale_predictions_ensemble(
     return xr.Dataset({"t2m": t2m, "si10": si10})
 
 
+def rescale_predictions(
+    predictions: xr.Dataset, statistics: xr.Dataset, cfg: oc.OmegaConf
+) -> xr.Dataset:
+    distribution_name = cfg.ex.distribution.strategy._target_
+    if cfg.ex.distribution in (
+        "pp2023.distribution.BernsteinQuantileFunctionStrategy",
+        "pp2023.distribution.QuantileRegressionStrategy",
+    ):
+        return rescale_predictions_ensemble(prediction, statistics)
+    elif distribution_name == "pp2023.distribution.NormalParametricStrategy":
+        return rescale_normal_parameters(predictions, statistics)
+    else:
+        raise KeyError(f"Don't know how to rescale distribution {distribution_name}.")
+
+
+def rescale_normal_parameters(
+    prediction: xr.Dataset, statistics: xr.Dataset
+) -> xr.Dataset:
+    t2m_mu_rescaled = prediction.t2m.isel(parameter=0)
+    log_t2m_sigma_rescaled = prediction.t2m.isel(parameter=1)
+    t2m_sigma_rescaled = np.exp(log_t2m_sigma_rescaled)
+
+    log_si10_mu = prediction.si10.isel(parameter=0)
+    log_si10_sigma = np.exp(prediction.si10.isel(parameter=1))
+
+    t2m_mu = t2m_mu_rescaled * statistics.std_obs_t2m + statistics.mean_obs_t2m
+    t2m_sigma = t2m_sigma_rescaled * statistics.std_obs_t2m
+
+    """See https://stats.stackexchange.com/questions/93082/if-x-is-normally-distributed-can-logx-also-be-normally-distributed for wind"""
+    si10_sigma = log_si10_sigma / log_si10_mu
+    si10_mu = np.exp(log_si10_mu + 0.5 * log_si10_sigma**2)
+
+    t2m = np.stack((t2m_mu, t2m_sigma), axis=-1)
+    si10 = np.stack((si10_mu, si10_sigma), axis=-1)
+
+    t2m_xr = xr.DataArray(t2m, coords=prediction.coords)
+    si10_xr = xr.DataArray(si10, coords=prediction.coords)
+
+    output_xr = xr.Dataset({"t2m": t2m_xr, "si10": si10_xr}, coords=prediction.coords)
+
+    return output_xr
+
+
 class ModelPredictions(aq.Task):
     def __init__(
         self,
@@ -241,12 +287,14 @@ class ModelPredictions(aq.Task):
         model_name: Optional[str] = None,
         run_id: Optional[str] = None,
         overrides: Optional[list[str]] = None,
+        test_set: bool = False,
     ):
         self.model_name = model_name
         self.run_id = run_id
         self.station_set = station_set
         self.overrides = overrides
         self.step_coord = [pd.to_timedelta(x, unit="days") for x in range(3)]
+        self.test_set = test_set
 
     def requirements(self):
         return RescaleStatistics(self.station_set)
@@ -261,17 +309,23 @@ class ModelPredictions(aq.Task):
         )
 
         self.run_id = run_id
+        predictions, cfg = predict(
+            run_id, overrides=self.overrides, test_set=self.test_set
+        )
 
-        predictions = predict(run_id, overrides=self.overrides)
         predictions_xr = interpret_predictions(predictions, rescale_statistics.station)
-        rescaled_predictions = rescale_predictions_ensemble(
-            predictions_xr, rescale_statistics
+        rescaled_predictions = rescale_predictions(
+            predictions_xr, rescale_statistics, cfg
         )
 
         return rescaled_predictions
 
     def artifact(self):
-        return aq.LocalStoreArtifact(f"pp2023/predictions/{self.run_id}.nc")
+        set_name = "test" if self.test_set else "val"
+
+        return aq.LocalStoreArtifact(
+            f"pp2023/predictions/ens10/{self.run_id}_{set_name}.nc"
+        )
 
 
 class SMC01_ModelPredictions(ModelPredictions):
@@ -280,11 +334,20 @@ class SMC01_ModelPredictions(ModelPredictions):
         model_name: Optional[str] = None,
         run_id: Optional[str] = None,
         overrides: Optional[list[str]] = None,
+        test_set: bool = False,
     ):
         self.model_name = model_name
         self.run_id = run_id
         self.overrides = overrides
         self.step_coord = [pd.to_timedelta(3 * x, unit="hours") for x in range(81)]
+        self.test_set = test_set
 
     def requirements(self):
         return SMC01_RescaleStatistics()
+
+    def artifact(self):
+        set_name = "test" if self.test_set else "val"
+
+        return aq.LocalStoreArtifact(
+            f"pp2023/predictions/smc/{self.run_id}_{set_name}.nc"
+        )

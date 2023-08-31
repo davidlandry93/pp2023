@@ -109,10 +109,13 @@ class NormalParametricStrategy(DistributionalForecastStrategy):
         return NormalParametric(processed_features, loss_fn=self.loss_fn)
 
     def nwp_base(self, batch):
-        forecast_params = batch["forecast_parameters"]
+        forecast_mu = batch["forecast"].mean(dim=1)
 
-        forecast_mu = forecast_params[..., 0]
-        forecast_sigma = forecast_params[..., 1]
+        if batch["forecast"].shape[1] == 1:
+            forecast_sigma = torch.full_like(forecast_mu, 1.0)
+        else:
+            forecast_sigma = batch["forecast"].std(dim=1)
+
         log_forecast_sigma = torch.log(forecast_sigma + 1e-6)
 
         processed_forecast_params = torch.stack(
@@ -143,7 +146,6 @@ class NormalParametric(DistributionalForecast):
         loc = torch.stack([loc_t2m, loc_log_si10], dim=-1)
 
         scale = params[..., 1]
-        scale = torch.clamp(scale, min=1e-6)
 
         self.distribution = td.Normal(loc=loc, scale=scale)
 
@@ -336,8 +338,8 @@ class BernsteinQuantileFunctionForecast(DistributionalForecast):
 
 
 class BernsteinQuantileFunctionStrategy(DistributionalForecastStrategy):
-    def __init__(self, degree: int, use_base=True, variable_idx=None):
-        self.degree = degree
+    def __init__(self, n_parameters: int, use_base=True, variable_idx=None):
+        self.degree = n_parameters - 1
         self.variable_idx = None
         self.use_base = use_base
 
