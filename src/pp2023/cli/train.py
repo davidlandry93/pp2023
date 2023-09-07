@@ -152,14 +152,14 @@ def train_cli(cfg):
         steps_per_epoch = len(datamodule.train_dataloader())
 
         model = build_model_from_config(cfg)
-        distribution_strat = hydra.utils.instantiate(cfg.ex.distribution.strategy)
+        distribution_mapping = hydra.utils.instantiate(cfg.ex.distribution.mapping)
         optimizer = hydra.utils.instantiate(cfg.ex.optimizer, model.parameters())
         scheduler = hydra.utils.instantiate(
             cfg.ex.scheduler.instance, optimizer, steps_per_epoch=steps_per_epoch
         )
         lightning_module = PP2023Module(
             model,
-            distribution_strat,
+            distribution_mapping,
             optimizer,
             scheduler,
             scheduler_interval=cfg.ex.scheduler.interval,
@@ -177,7 +177,7 @@ def train_cli(cfg):
                 **make_tags(),
             }
 
-            if cfg.ex.distribution.strategy.get("variable_idx", None) is not None:
+            if cfg.ex.distribution.mapping.get("variable_idx", None) is not None:
                 """Here I make a note to myself that the number of parameters is
                 invalid if we are targeting a particular variable. If we pick one variable,
                 the number of parameters is too highg because the model still has params

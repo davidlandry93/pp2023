@@ -13,7 +13,7 @@ import os
 
 from torch.optim.optimizer import Optimizer
 
-from .distribution import DistributionalForecast
+from .distribution.mapping import PP2023_DistributionMapping
 from .cli.base import build_dataloaders_from_config
 
 
@@ -39,7 +39,7 @@ class PP2023Module(pl.LightningModule):
     def __init__(
         self,
         model: nn.Module,
-        distribution_strategy: Callable[[torch.Tensor], DistributionalForecast],
+        distribution_mapping: PP2023_DistributionMapping,
         optimizer=None,
         scheduler=None,
         scheduler_interval="epoch",
@@ -47,7 +47,7 @@ class PP2023Module(pl.LightningModule):
     ):
         super().__init__()
         self.model = model
-        self.distribution_strat = distribution_strategy
+        self.distribution_map = distribution_mapping
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.scheduler_interval = scheduler_interval
@@ -74,20 +74,6 @@ class PP2023Module(pl.LightningModule):
         mask = ~(torch.isnan(target).any(dim=-1))
 
         return mask
-
-    def make_prediction(self, batch, mask):
-        params = self.make_parameters(batch, mask)
-        predicted_distribution = self.distribution_strat.from_tensor(params)
-        return predicted_distribution
-
-    def make_parameters(self, batch, mask):
-        nwp_base = self.distribution_strat.nwp_base(batch)
-        correction = self.forward(batch)
-
-        prediction = nwp_base + correction
-        masked_prediction = prediction[mask]
-
-        return masked_prediction
 
     def compute_loss(
         self,
@@ -141,6 +127,26 @@ class PP2023Module(pl.LightningModule):
 
         return crpss.mean()
 
+    def make_distribution(self, batch):
+        model_output = self.forward(batch)
+
+        mask = self.make_missing_obs_mask(batch)
+        masked_target = batch["target"][mask]
+        masked_forecast = batch["forecast"].transpose(1, 2)[
+            mask
+        ]  # Move the ensemble member dim so that we can keep it after mask application.
+        masked_model_output = model_output[mask]
+
+        if self.variable_idx:
+            masked_forecast = masked_forecast[..., [self.variable_idx]]
+            masked_target = masked_target[..., [self.variable_idx]]
+
+        predicted_distribution = self.distribution_map.make_distribution(
+            masked_forecast, masked_model_output
+        )
+
+        return predicted_distribution
+
     def training_step(self, batch, batch_idx):
         if self.trainer.is_global_zero:
             if batch_idx % 20 == 0:
@@ -152,7 +158,7 @@ class PP2023Module(pl.LightningModule):
         if self.variable_idx:
             masked_target = masked_target[..., [self.variable_idx]]
 
-        predicted_distribution = self.make_prediction(batch, mask)
+        predicted_distribution = self.make_distribution(batch)
 
         loss = self.compute_loss(predicted_distribution, masked_target, log_step=False)
 
@@ -171,7 +177,7 @@ class PP2023Module(pl.LightningModule):
         if self.variable_idx:
             masked_target = masked_target[..., [self.variable_idx]]
 
-        predicted_distribution = self.make_prediction(batch, mask)
+        predicted_distribution = self.make_distribution(batch)
 
         loss = self.compute_loss(
             predicted_distribution, masked_target, logging_prefix="Val"
@@ -194,20 +200,13 @@ class PP2023Module(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         batch_size = batch["features"].shape[0]
 
-        predicted_distribution = self.make_parameters(
-            batch,
-            torch.ones(
-                batch_size,
-                dtype=torch.bool,
-                device=batch["forecast"].device,
-            ),
-        )
+        model_output = self.model(batch)
 
         return {
             "forecast_time": batch["forecast_time"],
             "step_idx": batch["step_idx"],
             "step_ns": batch["step_ns"],
-            "prediction": predicted_distribution,
+            "prediction": model_output,
         }
 
     def on_train_epoch_end(self) -> None:

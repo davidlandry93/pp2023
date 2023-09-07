@@ -3,79 +3,8 @@ import math
 import torch
 import torch.distributions as td
 
-SQRT_PI = math.sqrt(math.pi)
 
 LOG_SI10_CLAMP = -0.2
-
-
-def crps_empirical(Q: torch.tensor, y: torch.tensor, sorted=False):
-    """Compute the CRPS of an empirical distribution. Q is the sorted samples of the empirical distribution,
-    where the last dimension is the sample dimension.
-    Q and y should have the same shape except for the last dimension.
-
-    Args:
-        Q: The samples that form the empirical distribution.
-        y: The observations.
-
-    Return:
-        A tensor containing the CRPS of each distribution given their respective observations.
-    """
-
-    if not sorted:
-        values, _ = torch.sort(Q, dim=-1)
-        Q = values
-
-    N = Q.shape[-1]
-
-    right_width = torch.cat(
-        [
-            Q[..., 0:1] - y,
-            Q[..., 1:] - torch.maximum(y, Q[..., :-1]),
-            torch.zeros(
-                *Q.shape[:-1], 1, device=Q.device
-            ),  # Right integral is never used if the obs is to the right of the distribution, so set width to zero.
-        ],
-        dim=-1,
-    )
-
-    left_width = torch.cat(
-        [
-            torch.zeros(
-                *Q.shape[:-1], 1, device=Q.device
-            ),  # Left integral is never used if the obs is to the left of the distribution.
-            torch.minimum(y, Q[..., 1:]) - Q[..., :-1],
-            y - Q[..., [-1]],
-        ],
-        dim=-1,
-    )
-
-    weights = torch.arange(0, N + 1, device=Q.device) / N
-    right_weights = (1 - weights) ** 2
-    left_weights = weights**2
-
-    left = torch.clamp(left_width, min=0) * left_weights
-    right = torch.clamp(right_width, min=0) * right_weights
-
-    return (left + right).sum(dim=-1)
-
-
-def crps_normal(dist: torch.distributions.Normal, sample: torch.Tensor):
-    """See http://cran.nexr.com/web/packages/scoringRules/vignettes/crpsformulas.html#Normal."""
-    mean = dist.loc
-    std = dist.scale
-    centered_dist = torch.distributions.Normal(
-        torch.zeros_like(mean), scale=torch.ones_like(std)
-    )
-
-    centered_sample = (sample - mean) / std
-
-    cdf = centered_dist.cdf(centered_sample)
-    pdf = torch.exp(centered_dist.log_prob(centered_sample))
-
-    centered_crps = centered_sample * (2 * cdf - 1) + 2 * pdf - (1 / SQRT_PI)
-    crps = std * centered_crps
-
-    return crps
 
 
 class DistributionalForecast:
@@ -265,26 +194,6 @@ class QuantileRegression(DistributionalForecast):
         return crps_empirical(self.parameters, x.unsqueeze(-1), sorted=True)
 
 
-class QuantileRegressionStrategy(DistributionalForecastStrategy):
-    def __init__(self, n_quantiles: int, regularization: float = 1e-6):
-        self.n_quantiles = n_quantiles
-        self.regularization = regularization
-
-    def nwp_base(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        members_values = torch.gather(batch["forecast"], 1, batch["forecast_sort_idx"])
-
-        n_members = batch["forecast"].shape[1]
-        n_quantile = self.n_quantiles
-        member_idx = torch.round(torch.linspace(0, n_members - 1, n_quantile)).int()
-
-        # Use the nearest member quantile as a base for the forcetast.
-        # This way we decouple the number of members and the number of quantiles.
-        return members_values[:, member_idx].transpose(1, 2).transpose(2, 3)
-
-    def from_tensor(self, x: torch.Tensor) -> "QuantileRegression":
-        return QuantileRegression(x, regularization=self.regularization)
-
-
 def quantile_loss(quantile_values, obs, quantiles=None):
     """Args
     quantile_values: Tensor with the last dimension reserved for quantile values.
@@ -432,67 +341,3 @@ def deltas_to_quantiles(deltas):
 
     quantiles = torch.cat([left_quantiles, mid_value, right_quantiles], dim=-1)
     return quantiles
-
-
-class AdditiveQuantileRegression(DistributionalForecast):
-    def __init__(self, params, loss="crps"):
-        LOSSES_FOR_ADDITIVE = {
-            "crps": self.crps,
-            "quantile_loss": self.quantile_loss,
-        }
-
-        self.loss_fn = LOSSES_FOR_ADDITIVE[loss]
-
-        t2m, log_si10 = params[..., 0, :], params[..., 1, :]
-
-        # Restrain log_si10 to a minimum of zero so that expm1(log_si10) will also be
-        # restrainted to zero when rescaling to the usual units.
-        log_si10 = torch.clamp(log_si10, min=LOG_SI10_CLAMP)
-
-        params = torch.stack([t2m, log_si10], dim=-2)
-        self.parameters = params
-
-    def params_to_quantiles(self):
-        quantiles = deltas_to_quantiles(self.parameters)
-        t2m, log_si10 = quantiles[..., 0, :], quantiles[..., 1, :]
-        log_si10 = torch.clamp(log_si10, min=LOG_SI10_CLAMP)
-        quantiles = torch.stack([t2m, log_si10], dim=-2)
-        return quantiles
-
-    def loss(self, x: torch.Tensor):
-        return self.loss_fn(x)
-
-    def quantile_loss(self, x):
-        quantile_values = self.params_to_quantiles()
-        quantile_loss_comp = quantile_loss(quantile_values, x)
-
-        return quantile_loss_comp
-
-    def crps(self, x: torch.Tensor):
-        quantile_values = self.params_to_quantiles()
-        return crps_empirical(quantile_values, x.unsqueeze(-1), sorted=True)
-
-
-class AdditiveQuantileRegressionStrategy(DistributionalForecastStrategy):
-    def __init__(self, n_quantiles: int, loss="crps"):
-        self.n_quantiles = n_quantiles
-        self.loss_fn_name = loss
-
-    def nwp_base(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        members_values = torch.gather(batch["forecast"], 1, batch["forecast_sort_idx"])
-
-        n_members = batch["forecast"].shape[1]
-        n_quantile = self.n_quantiles
-        member_idx = torch.round(torch.linspace(0, n_members - 1, n_quantile)).int()
-
-        quantiles = members_values[:, member_idx].transpose(1, 2).transpose(2, 3)
-
-        # Use the nearest member quantile as a base for the forcetast.
-        # This way we decouple the number of members and the number of quantiles.
-
-        deltas = quantiles_to_deltas(quantiles)
-
-        return deltas
-
-    def from_tensor(self, x: torch.Tensor) -> "QuantileRegression":
-        return AdditiveQuantileRegression(x, loss=self.loss_fn_name)

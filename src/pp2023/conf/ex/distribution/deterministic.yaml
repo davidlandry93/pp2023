@@ -1,5 +1,3 @@
 n_parameters: 1
-strategy:
-  _target_: pp2023.distribution.base.DeterministicStrategy
-  variable_idx: ${ex.variable_idx}
-  use_base: True 
+mapping:
+  _target_: pp2023.distribution.mapping.DeterministicMapping
