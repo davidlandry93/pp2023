@@ -1,10 +1,9 @@
 _target_: pp2023.model.mlp.MLP
-embedding_size: 64
+embedding_size: 256
 n_blocks: 4
 use_station_embedding: true
 use_step_embedding: true
 use_step_feature: true
 use_member_embedding: false
-embedding_activation: true
+embedding_activation: false
 use_metadata_features: true
-sort_target_variables: true

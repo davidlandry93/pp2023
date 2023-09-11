@@ -22,7 +22,6 @@ class MLP(nn.Module):
         embedding_activation=True,
         use_metadata_features=True,
         use_step_feature=True,
-        sort_target_variables=False,
     ):
         super().__init__()
 
@@ -31,7 +30,6 @@ class MLP(nn.Module):
 
         self.use_metadata_features = use_metadata_features
         self.use_step_feature = use_step_feature
-        self.sort_target_variables = sort_target_variables
 
         # Add to in_features because we concatenate with time features.
 
@@ -92,13 +90,6 @@ class MLP(nn.Module):
             features = torch.cat([batch["features"], metadata_features], dim=-1)
         else:
             features = batch["features"]
-
-        if self.sort_target_variables:
-            t2m, si10, rest = features[..., 0:1], features[..., 1:2], features[..., 2:]
-
-            t2m_sorted, _ = torch.sort(t2m, dim=1)
-            si10_sorted, _ = torch.sort(si10, dim=1)
-            features = torch.cat([t2m_sorted, si10_sorted, rest], dim=-1)
 
         projected_features = self.projection(features)
 

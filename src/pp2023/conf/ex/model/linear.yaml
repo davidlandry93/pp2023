@@ -1,6 +1,6 @@
 _target_: pp2023.model.linear.Linear
 n_time_models: 12
-n_variables: 2
+n_variables: ${ex.n_variables}
 share_member: True
 share_station: True
 share_step: True

@@ -23,6 +23,7 @@ from eddie.pp2023.smc01 import SMC01_RescaleStatistics
 
 from ..lightning import PP2023Module
 from ..cli.base import build_model_from_config, build_dataloaders_from_config
+from ..distribution.mapping import PP2023_DistributionMapping
 
 
 def get_run_object(run_id: str, mlflow_tracking_uri=None):
@@ -65,17 +66,18 @@ def load_cfg_from_run(artifact_path: pathlib.Path, overrides=None) -> oc.DictCon
     return cfg
 
 
-def get_model_from_id(mlflow_run, overrides=None):
+def get_model_from_id(mlflow_run, overrides=None, map_location=""):
     artifact_path = artifact_path_of_run(mlflow_run)
     cfg = load_cfg_from_run(artifact_path, overrides=overrides)
 
     model = build_model_from_config(cfg)
-    distribution_strategy = hydra.utils.instantiate(cfg.ex.distribution.strategy)
+    distribution_mapping = hydra.utils.instantiate(cfg.ex.distribution.mapping)
     module = PP2023Module.load_from_checkpoint(
         artifact_path / "best_checkpoint.ckpt",
         model=model,
-        distribution_strategy=distribution_strategy,
+        distribution_mapping=distribution_mapping,
         map_location="cpu",
+        variable_idx=cfg.ex.variable_idx,
     )
 
     return cfg, module
@@ -96,7 +98,10 @@ def predict(run_id, mlflow_tracking_uri=None, test_set=False, overrides=None):
 
     to_return = {}
     for k in predictions[0]:
-        to_return[k] = torch.cat([p[k] for p in predictions]).cpu()
+        if k != "distribution_type":
+            to_return[k] = torch.cat([p[k] for p in predictions]).cpu()
+
+    to_return["distribution_type"] = predictions[0]["distribution_type"]
 
     return to_return, cfg
 
@@ -137,17 +142,23 @@ def get_artifact_path_from_run_id(run_id: str) -> pathlib.Path:
 
 
 def interpret_tensor_for_variable(
-    tensor: np.array, forecast_time: np.array, step_idx: np.array
+    tensor: np.array,
+    forecast_time: np.array,
+    step_idx: np.array,
+    station_idx: np.array,
 ) -> xr.DataArray:
     tensor_xr = xr.DataArray(
         tensor,
-        dims=["batch", "station", "parameter"],
+        dims=["batch", "parameter"],
         coords={
             "batch": pd.MultiIndex.from_arrays(
-                (forecast_time, step_idx), names=("forecast_time", "step")
+                (forecast_time, step_idx, station_idx),
+                names=("forecast_time", "step", "station"),
             ),
         },
-    ).unstack("batch")
+    )
+
+    tensor_xr = tensor_xr.unstack("batch")
 
     return tensor_xr
 
@@ -159,68 +170,35 @@ def interpret_predictions(
     forecast_time = predictions["forecast_time"].numpy().astype("datetime64[ns]")
 
     step_coord_np = predictions["step_ns"].numpy().astype("timedelta64[ns]")
+
+    station_idx_np = predictions["station"].numpy()
+
     t2m = interpret_tensor_for_variable(
-        predictions["prediction"][:, :, 0], forecast_time, step_coord_np
+        predictions["parameters"][:, 0],
+        forecast_time,
+        step_coord_np,
+        station_idx_np,
     )
 
-    si10 = interpret_tensor_for_variable(
-        predictions["prediction"][:, :, 1], forecast_time, step_coord_np
-    )
+    data_arrays = {"t2m": t2m}
+
+    if predictions["parameters"].shape[1] > 1:
+        """We made a prediction for wind as well"""
+        si10 = interpret_tensor_for_variable(
+            predictions["parameters"][:, 1],
+            forecast_time,
+            step_coord_np,
+            station_idx_np,
+        )
+        data_arrays["si10"] = si10
 
     return (
-        xr.Dataset({"t2m": t2m, "si10": si10})
+        xr.Dataset(data_arrays)
         .sortby("forecast_time")
         .transpose("forecast_time", "step", "station", "parameter")
+        .reindex(station=list(range(len(stations))))
         .assign_coords(station=stations)
     )
-
-
-def make_prediction(
-    run_id: str, test_set: bool = False
-) -> list[dict[str, torch.Tensor]]:
-    artifact_path = get_artifact_path_from_run_id(run_id)
-
-    with (artifact_path / "hydra" / "overrides.yaml").open() as overrides_file:
-        overrides = yaml.safe_load(overrides_file)
-
-    with hydra.initialize_config_module(
-        "pp2023.conf", job_name="infer", version_base="1.3"
-    ):
-        cfg = hydra.compose("train", overrides=overrides)
-
-    lightning_checkpoint = torch.load(
-        artifact_path / "best_checkpoint.ckpt", map_location="cpu"
-    )
-    lightning_state_dict = lightning_checkpoint["state_dict"]
-
-    state_dict = {}
-    for k in lightning_state_dict:
-        # Remove the "model." predict that lightning added.
-        new_key = ".".join(k.split(".")[1:])
-        state_dict[new_key] = lightning_state_dict[k]
-
-    model = build_model_from_config(cfg)
-    model.load_state_dict(state_dict)
-
-    _, val_loader, test_loader = build_dataloaders_from_config(cfg)
-
-    loader = test_loader if test_set else val_loader
-
-    predictions = []
-    for b in tqdm.tqdm(loader):
-        with torch.no_grad():
-            pred = model(b)
-
-        predictions.append(
-            {
-                "forecast_time": b["forecast_time"],
-                "model_predictions": pred,
-                "step_idx": b["step_idx"],
-                "step_ns": b["step_ns"],
-            }
-        )
-
-    return predictions
 
 
 def rescale_predictions_ensemble(
@@ -228,56 +206,91 @@ def rescale_predictions_ensemble(
 ) -> xr.Dataset:
     t2m = prediction.t2m * statistics.std_obs_t2m + statistics.mean_obs_t2m
 
+    output_vars = {"t2m": t2m}
+
     # Unnecessary since we changed the wind rescale strategy to log only
     # log_si10 = (
     #     prediction.si10 * statistics.log_std_obs_si10 + statistics.log_mean_obs_si10
     # )
-    si10 = np.clip(np.expm1(prediction.si10), a_min=0.0, a_max=None)
 
-    return xr.Dataset({"t2m": t2m, "si10": si10})
+    if "si10" in prediction:
+        si10 = np.clip(np.exp(prediction.si10), a_min=0.0, a_max=None)
+        output_vars["si10"] = si10
+
+    return xr.Dataset(output_vars)
+
+
+# def rescale_normal_parameters(
+#     prediction: xr.Dataset, statistics: xr.Dataset
+# ) -> xr.Dataset:
+#     t2m_mu_rescaled = prediction.t2m.isel(parameter=0)
+#     log_t2m_sigma_rescaled = prediction.t2m.isel(parameter=1)
+#     t2m_sigma_rescaled = np.exp(log_t2m_sigma_rescaled)
+
+#     t2m_mu = t2m_mu_rescaled * statistics.std_obs_t2m + statistics.mean_obs_t2m
+#     t2m_sigma = t2m_sigma_rescaled * statistics.std_obs_t2m
+
+#     t2m = np.stack((t2m_mu, t2m_sigma), axis=-1)
+#     t2m_xr = xr.DataArray(t2m, coords=prediction.coords)
+#     output_vars = {"t2m": t2m_xr}
+
+#     if "si10" in prediction:
+#         log_si10_mu = prediction.si10.isel(parameter=0)
+#         log_si10_sigma = np.exp(prediction.si10.isel(parameter=1))
+
+#         """See https://stats.stackexchange.com/questions/93082/if-x-is-normally-distributed-can-logx-also-be-normally-distributed for wind"""
+#         si10_sigma = log_si10_sigma / log_si10_mu
+#         si10_mu = np.exp(log_si10_mu + 0.5 * log_si10_sigma**2)
+
+#         si10 = np.stack((si10_mu, si10_sigma), axis=-1)
+
+#         si10_xr = xr.DataArray(si10, coords=prediction.coords)
+#         output_vars["si10"] = si10_xr
+
+#     output_xr = xr.Dataset(output_vars, coords=prediction.coords)
+
+#     return output_xr
 
 
 def rescale_predictions(
-    predictions: xr.Dataset, statistics: xr.Dataset, cfg: oc.OmegaConf
+    predictions_xr: xr.Dataset, prediction_type: str, rescale_statistics: xr.Dataset
 ) -> xr.Dataset:
-    distribution_name = cfg.ex.distribution.strategy._target_
-    if cfg.ex.distribution in (
-        "pp2023.distribution.BernsteinQuantileFunctionStrategy",
-        "pp2023.distribution.QuantileRegressionStrategy",
-    ):
-        return rescale_predictions_ensemble(prediction, statistics)
-    elif distribution_name == "pp2023.distribution.NormalParametricStrategy":
-        return rescale_normal_parameters(predictions, statistics)
-    else:
-        raise KeyError(f"Don't know how to rescale distribution {distribution_name}.")
+    match prediction_type:
+        case "normal":
+            return rescale_normal_predictions(predictions_xr, rescale_statistics)
+        case "quantile":
+            return rescale_predictions_ensemble(predictions_xr, rescale_statistics)
+        case "deterministic":
+            return rescale_deterministic_predictions(predictions_xr, rescale_statistics)
+        case _:
+            raise ValueError()
 
 
-def rescale_normal_parameters(
-    prediction: xr.Dataset, statistics: xr.Dataset
+def rescale_normal_predictions(
+    parameters: xr.DataArray, rescale_statistics: xr.DataArray
+) -> xr.DataArray:
+    parameters = parameters.assign_coords(parameter=["loc", "scale"])
+
+    t2m_loc = parameters.t2m.sel(parameter="loc")
+    t2m_loc_rescaled = (
+        t2m_loc * rescale_statistics.std_obs_t2m + rescale_statistics.mean_obs_t2m
+    )
+
+    t2m_std = parameters.t2m.sel(parameter="scale")
+    t2m_scale_rescaled = t2m_std * rescale_statistics.std_obs_t2m
+
+    t2m = xr.combine_nested(
+        [t2m_loc_rescaled, t2m_scale_rescaled], concat_dim="parameter"
+    )
+
+    return xr.Dataset({"t2m": t2m}, coords=t2m.coords)
+
+
+def rescale_deterministic_predictions(
+    parameters, rescale_statistics: xr.Dataset
 ) -> xr.Dataset:
-    t2m_mu_rescaled = prediction.t2m.isel(parameter=0)
-    log_t2m_sigma_rescaled = prediction.t2m.isel(parameter=1)
-    t2m_sigma_rescaled = np.exp(log_t2m_sigma_rescaled)
-
-    log_si10_mu = prediction.si10.isel(parameter=0)
-    log_si10_sigma = np.exp(prediction.si10.isel(parameter=1))
-
-    t2m_mu = t2m_mu_rescaled * statistics.std_obs_t2m + statistics.mean_obs_t2m
-    t2m_sigma = t2m_sigma_rescaled * statistics.std_obs_t2m
-
-    """See https://stats.stackexchange.com/questions/93082/if-x-is-normally-distributed-can-logx-also-be-normally-distributed for wind"""
-    si10_sigma = log_si10_sigma / log_si10_mu
-    si10_mu = np.exp(log_si10_mu + 0.5 * log_si10_sigma**2)
-
-    t2m = np.stack((t2m_mu, t2m_sigma), axis=-1)
-    si10 = np.stack((si10_mu, si10_sigma), axis=-1)
-
-    t2m_xr = xr.DataArray(t2m, coords=prediction.coords)
-    si10_xr = xr.DataArray(si10, coords=prediction.coords)
-
-    output_xr = xr.Dataset({"t2m": t2m_xr, "si10": si10_xr}, coords=prediction.coords)
-
-    return output_xr
+    pred = rescale_predictions_ensemble(parameters, rescale_statistics)
+    return pred
 
 
 class ModelPredictions(aq.Task):
@@ -315,7 +328,7 @@ class ModelPredictions(aq.Task):
 
         predictions_xr = interpret_predictions(predictions, rescale_statistics.station)
         rescaled_predictions = rescale_predictions(
-            predictions_xr, rescale_statistics, cfg
+            predictions_xr, predictions["distribution_type"], rescale_statistics
         )
 
         return rescaled_predictions

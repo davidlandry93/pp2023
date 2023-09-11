@@ -1,3 +1,5 @@
+from typing import Any
+
 import math
 import torch.distributions
 
@@ -86,6 +88,9 @@ class PP2023_Distribution:
     def crps(self, observation: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError()
 
+    def to_dict(self) -> dict[str, Any]:
+        raise NotImplementedError()
+
 
 class NormalDistribution(PP2023_Distribution):
     def __init__(self, loc, scale):
@@ -96,6 +101,14 @@ class NormalDistribution(PP2023_Distribution):
 
     def crps(self, observation):
         return crps_normal(self.distribution, observation)
+
+    def to_dict(self):
+        return {
+            "distribution_type": "normal",
+            "parameters": torch.stack(
+                [self.distribution.loc, self.distribution.scale], dim=-1
+            ),
+        }
 
 
 class QuantileDistribution(PP2023_Distribution):
@@ -117,13 +130,24 @@ class QuantileDistribution(PP2023_Distribution):
     def crps(self, observation):
         return crps_empirical(self.quantiles, observation, sorted=True)
 
+    def to_dict(self):
+        return {"distribution_type": "quantile", "parameters": self.quantiles}
+
 
 class DeterministicDistribution(PP2023_Distribution):
-    def __init__(self, predictions):
-        self.preds = predictions.squeeze()
+    def __init__(self, predictions: torch.Tensor):
+        self.preds = predictions.squeeze(
+            -1
+        )  # Remove params dimension since we have only one.
 
     def loss(self, observation):
         return torch.square(observation - self.preds)
 
     def crps(self, observation):
         return torch.abs(observation - self.preds)
+
+    def to_dict(self):
+        return {
+            "distribution_type": "deterministic",
+            "parameters": self.preds.unsqueeze(dim=-1),
+        }
