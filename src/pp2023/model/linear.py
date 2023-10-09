@@ -25,6 +25,8 @@ class Linear(nn.Module):
         embedding_step=False,
         embedding_time=False,
         use_metadata_features=True,
+        use_step_feature=True,
+        use_spatial_features=True,
     ):
         super().__init__()
         self.time_model_span = math.ceil(N_DAYS_YEAR / n_time_models)
@@ -35,6 +37,8 @@ class Linear(nn.Module):
         self.share_time = share_time
 
         self.use_metadata_features = use_metadata_features
+        self.use_spatial_features = use_spatial_features
+        self.use_step_feature = use_step_feature
 
         model_size_station = 1 if share_station else n_stations
         model_size_member = 1 if share_member else n_members
@@ -43,6 +47,12 @@ class Linear(nn.Module):
 
         if use_metadata_features:
             in_features += 7
+
+        if not use_step_feature:
+            in_features -= 1
+
+        if not use_spatial_features:
+            in_features -= 4
 
         self.coefs = nn.Parameter(
             torch.empty(
@@ -80,9 +90,20 @@ class Linear(nn.Module):
             step_idx = batch["step_idx"]
 
         if self.use_metadata_features:
-            features = torch.cat(
-                [batch["features"], batch["metadata_features"]], dim=-1
-            )
+            features_to_keep = list(range(7))
+
+            if not self.use_spatial_features:
+                features_to_keep.remove(3)
+                features_to_keep.remove(4)
+                features_to_keep.remove(5)
+                features_to_keep.remove(6)
+
+            if not self.use_step_feature:
+                features_to_keep.remove(2)
+
+            metadata_features = batch["metadata_features"][..., features_to_keep]
+
+            features = torch.cat([batch["features"], metadata_features], dim=-1)
         else:
             features = batch["features"]
 

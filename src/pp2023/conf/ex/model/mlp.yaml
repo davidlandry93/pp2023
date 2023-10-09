@@ -7,3 +7,4 @@ use_step_feature: true
 use_member_embedding: false
 embedding_activation: false
 use_metadata_features: true
+use_spatial_features: true

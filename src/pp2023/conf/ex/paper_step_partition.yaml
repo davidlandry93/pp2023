@@ -1,7 +1,7 @@
 defaults:
-- dataset: gdps_prebatch_24h
+- dataset: gdps_prebatch_partition
 - model: mlp
-- distribution: deterministic
+- distribution: quantile
 - optimizer: adam
 - scheduler: reduce_lr_plateau
 - _self_
@@ -9,27 +9,24 @@ defaults:
 timeout_min: 1200
 
 batch_size:  # Use prebatched dataset.
-max_epochs: 2000
+max_epochs: 3000
 log_every_n_steps: 100
-early_stopping_patience: 150
+early_stopping_patience: 800
 
 variable_idx: 0
 n_variables: 1
 
 optimizer:
-  lr:
-    5e-4
-
-# scheduler:
-#   instance:
-#     max_lr: 5e-4
-#     pct_start: 0.05
-#     final_div_factor: 10
+  lr: 5e-4
 
 distribution:
   mapping:
     predict_wind: False
 
-
 model:
   n_variables: 1
+  use_step_embedding: false
+  use_step_feature: false
+
+dataset:
+  step_hour_label: ???
