@@ -657,25 +657,41 @@ class TableCRPS(aq.Task):
 
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        linear_experiment = client.get_experiment_by_name("pp2023_linear_table")
+        linear_experiment = client.get_experiment_by_name(
+            "pp2023_condition_linear_station"
+        )
         linear_runs = client.search_runs(
             experiment_ids=[linear_experiment.experiment_id]
         )
 
-        linear_runs = [
-            r.info.run_id for r in linear_runs if r.info.run_name == "no_share_stations"
-        ]
+        linear_run_filters = {
+            "model.share_step": "False",
+            "model.use_spatial_features": "False",
+            "model.share_station": "False",
+        }
 
-        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_table")
+        filtered_linear_runs = []
+        for run in linear_runs:
+            for k in linear_run_filters:
+                if run.data.params[k] == linear_run_filters[k]:
+                    filtered_linear_runs.append(run.info.run_id)
+
+        mlp_experiment = client.get_experiment_by_name(
+            "pp2023_condition_mlp_station_02"
+        )
         mlp_runs = client.search_runs(experiment_ids=[mlp_experiment.experiment_id])
         mlp_runs = [
             r.info.run_id
             for r in mlp_runs
-            if r.data.params["scheduler.instance._target_"]
-            == "pp2023.scheduler.reduce_lr_plateau"
+            if (
+                r.data.params["scheduler.instance._target_"]
+                == "pp2023.scheduler.reduce_lr_plateau"
+                and r.data.params["model.use_spatial_features"] == "True"
+                and r.data.params["model.use_station_embedding"] == "True"
+            )
         ]
 
-        all_runs = [*linear_runs, *mlp_runs]
+        all_runs = [*filtered_linear_runs, *mlp_runs]
 
         runs_tasks = [ModelMetrics(run_id=run_id, test_set=True) for run_id in all_runs]
 
@@ -701,6 +717,7 @@ class TableCRPS(aq.Task):
                     "distribution": metrics.coords["distribution"].item(),
                     "dataset": metrics.coords["dataset"].item(),
                     "model": metrics.coords["model"].item(),
+                    "run_id": metrics.run_id.item(),
                 }
             )
 
