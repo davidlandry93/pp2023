@@ -7,3 +7,7 @@ def reduce_lr_plateau(optimizer, *args, steps_per_epoch=None, **kwargs):
 
 def one_cycle(optimizer, *args, **kwargs):
     return torch.optim.lr_scheduler.OneCycleLR(optimizer, *args, **kwargs)
+
+
+def exponential(optimizer, *args, steps_per_epoch=None, **kwargs):
+    return torch.optim.lr_scheduler.ExponentialLR(optimizer, *args, **kwargs)

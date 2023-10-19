@@ -3,15 +3,15 @@ defaults:
 - model: mlp
 - distribution: deterministic
 - optimizer: adam
-- scheduler: reduce_lr_plateau
+- scheduler: one_cycle
 - _self_
 
 timeout_min: 1200
 
 batch_size:  # Use prebatched dataset.
-max_epochs: 2000
+max_epochs: 1000
 log_every_n_steps: 100
-early_stopping_patience: 150
+early_stopping_patience: 500
 
 variable_idx: 0
 n_variables: 1
@@ -19,12 +19,6 @@ n_variables: 1
 optimizer:
   lr:
     5e-4
-
-# scheduler:
-#   instance:
-#     max_lr: 5e-4
-#     pct_start: 0.05
-#     final_div_factor: 10
 
 distribution:
   mapping:

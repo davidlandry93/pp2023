@@ -8,3 +8,4 @@ use_member_embedding: false
 embedding_activation: false
 use_metadata_features: true
 use_spatial_features: true
+use_batch_norm: false

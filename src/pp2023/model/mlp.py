@@ -3,6 +3,15 @@ import torch
 import torch.nn as nn
 
 
+class TransposeBatchNorm(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(n_features)
+
+    def forward(self, x):
+        return self.bn(x.transpose(1, 2)).transpose(1, 2)
+
+
 class MLP(nn.Module):
     def __init__(
         self,
@@ -23,6 +32,7 @@ class MLP(nn.Module):
         use_metadata_features=True,
         use_step_feature=True,
         use_spatial_features=True,
+        use_batch_norm=False,
     ):
         super().__init__()
 
@@ -73,6 +83,10 @@ class MLP(nn.Module):
         blocks = []
         for _ in range(n_blocks):
             blocks.append(nn.Linear(embedding_size, embedding_size))
+
+            if use_batch_norm:
+                blocks.append(TransposeBatchNorm(embedding_size))
+
             blocks.append(nn.SiLU())
         hidden = nn.Sequential(*blocks)
         head = nn.Linear(embedding_size, n_variables * n_parameters)
@@ -118,6 +132,7 @@ class MLP(nn.Module):
             pooled_features += self.station_embedding
 
         correction = self.mlp(pooled_features)
+
         return correction.reshape(
             *correction.shape[:-1], self.n_variables, self.n_parameters
         )

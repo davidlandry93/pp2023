@@ -1,0 +1,4 @@
+interval: epoch
+instance:
+  _target_: pp2023.scheduler.exponential
+  gamma: 0.98

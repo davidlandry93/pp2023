@@ -1,6 +1,6 @@
 interval: step
 instance:
   _target_: torch.optim.lr_scheduler.OneCycleLR
-  max_lr: 1e-3
+  max_lr: ${ex.optimizer.lr}
   pct_start: 0.05
   epochs: ${ex.max_epochs}

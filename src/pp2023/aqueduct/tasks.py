@@ -504,7 +504,7 @@ def crps_gaussian_np(Q, y):
     return crps
 
 
-def requirements_for_run_metrics(run_id, test_set=False):
+def requirements_for_run_metrics(run_id, test_set=True):
     mlflow_run = get_run_object(run_id)
 
     if mlflow_run.data.params["dataset_name"].startswith("gdps"):
@@ -588,7 +588,7 @@ def compute_model_metrics(preds: xr.Dataset, obs: xr.Dataset) -> xr.Dataset:
 
 
 class ModelMetrics(aq.Task):
-    def __init__(self, run_id: str, test_set: bool = False):
+    def __init__(self, run_id: str, test_set: bool = True):
         self.run_id = run_id
         self.test_set = test_set
 
@@ -657,41 +657,18 @@ class TableCRPS(aq.Task):
 
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        linear_experiment = client.get_experiment_by_name(
-            "pp2023_condition_linear_station"
-        )
-        linear_runs = client.search_runs(
-            experiment_ids=[linear_experiment.experiment_id]
-        )
-
-        linear_run_filters = {
-            "model.share_step": "False",
-            "model.use_spatial_features": "False",
-            "model.share_station": "False",
-        }
-
-        filtered_linear_runs = []
-        for run in linear_runs:
-            for k in linear_run_filters:
-                if run.data.params[k] == linear_run_filters[k]:
-                    filtered_linear_runs.append(run.info.run_id)
-
-        mlp_experiment = client.get_experiment_by_name(
-            "pp2023_condition_mlp_station_02"
-        )
-        mlp_runs = client.search_runs(experiment_ids=[mlp_experiment.experiment_id])
-        mlp_runs = [
+        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_02")
+        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_03")
+        all_runs = [
             r.info.run_id
-            for r in mlp_runs
-            if (
-                r.data.params["scheduler.instance._target_"]
-                == "pp2023.scheduler.reduce_lr_plateau"
-                and r.data.params["model.use_spatial_features"] == "True"
-                and r.data.params["model.use_station_embedding"] == "True"
+            for r in client.search_runs(
+                experiment_ids=[
+                    experiment_mlp.experiment_id,
+                    experiment_linear.experiment_id,
+                ],
+                max_results=5000,
             )
         ]
-
-        all_runs = [*filtered_linear_runs, *mlp_runs]
 
         runs_tasks = [ModelMetrics(run_id=run_id, test_set=True) for run_id in all_runs]
 
@@ -707,19 +684,29 @@ class TableCRPS(aq.Task):
 
     def run(self, requirements: list[xr.Dataset]):
         rows = []
-        for metrics in requirements:
-            crps_mean = metrics.crps.mean()
-            rmse = np.sqrt(metrics.mse.mean())
-            rows.append(
-                {
-                    "rmse": rmse.item(),
-                    "crps": crps_mean.item(),
-                    "distribution": metrics.coords["distribution"].item(),
-                    "dataset": metrics.coords["dataset"].item(),
-                    "model": metrics.coords["model"].item(),
-                    "run_id": metrics.run_id.item(),
-                }
-            )
+        for full_metrics in requirements:
+            for lead in ["first_two", "all"]:
+                metrics = full_metrics.sel(step=full_metrics.step > pd.to_timedelta(0))
+                if lead == "first_two":
+                    metrics = metrics.sel(
+                        step=metrics.step <= pd.to_timedelta(2, unit="d")
+                    )
+
+                run_id = metrics["run_id"].item() if "run_id" in metrics else None
+
+                crps_mean = metrics.crps.mean()
+                rmse = np.sqrt(metrics.mse.mean())
+                rows.append(
+                    {
+                        "rmse": rmse.item(),
+                        "crps": crps_mean.item(),
+                        "distribution": metrics.coords["distribution"].item(),
+                        "dataset": metrics.coords["dataset"].item(),
+                        "model": metrics.coords["model"].item(),
+                        "run_id": run_id,
+                        "lead": lead,
+                    }
+                )
 
         df = pd.DataFrame(rows)
         df["dataset"] = df["dataset"].replace(
@@ -742,6 +729,9 @@ class MetricsByStep(TableCRPS):
         df["dataset"] = df["dataset"].replace(
             {"gdps_prebatch_24h": "gdps", "ens10_prebatch": "ens10"}
         )
+
+        # Filter case where dataset is gdps and step is 0
+        df = df[~((df["dataset"] == "gdps") & (df.index == pd.to_timedelta(0)))]
 
         return df
 
@@ -766,7 +756,8 @@ class DispersionByStep(aq.Task):
         client = mlflow.client.MlflowClient()
         linear_experiment = client.get_experiment_by_name("pp2023_linear_table")
         linear_runs = client.search_runs(
-            experiment_ids=[linear_experiment.experiment_id]
+            experiment_ids=[linear_experiment.experiment_id],
+            max_results=5000,
         )
 
         linear_runs = [
@@ -779,7 +770,8 @@ class DispersionByStep(aq.Task):
 
         mlp_experiment = client.get_experiment_by_name("pp2023_mlp_table")
         mlp_runs_response = client.search_runs(
-            experiment_ids=[mlp_experiment.experiment_id]
+            experiment_ids=[mlp_experiment.experiment_id],
+            max_results=5000,
         )
 
         mlp_runs = []
@@ -840,7 +832,7 @@ class DispersionByStep(aq.Task):
 
 
 class ModelSpreadErrorRatio(aq.Task):
-    def __init__(self, run_id: str, test_set: bool = False):
+    def __init__(self, run_id: str, test_set: bool = True):
         self.run_id = run_id
         self.test_set = test_set
 
@@ -861,31 +853,59 @@ class ModelSpreadErrorRatio(aq.Task):
         preds = preds.t2m
         obs = obs.obs_t2m
 
-        ensemble_mean = preds.mean(dim="parameter")
-        rmse_of_ensemble_mean = np.sqrt(
-            np.square(ensemble_mean - obs).mean(dim=["station", "forecast_time"])
+        if preds.distribution.item() in ["bernstein", "quantile"]:
+            ensemble_mean = preds.mean(dim="parameter")
+            rmse_of_ensemble_mean = np.sqrt(
+                np.square(ensemble_mean - obs).mean(dim=["station", "forecast_time"])
+            )
+
+            ensemble_variance = np.square(ensemble_mean - preds).sum(
+                dim="parameter"
+            ) / (preds.sizes["parameter"] - 1)
+
+            root_mean_ensemble_variance = np.sqrt(
+                ensemble_variance.mean(dim=["station", "forecast_time"])
+            )
+
+        elif preds.distribution.item() == "emos":
+            rmse_of_ensemble_mean = np.sqrt(
+                np.square(preds.sel(parameter="loc") - obs).mean(
+                    dim=["station", "forecast_time"]
+                )
+            ).drop("parameter")
+
+            ensemble_variance = np.square(preds.sel(parameter="scale"))
+            root_mean_ensemble_variance = np.sqrt(
+                ensemble_variance.mean(dim=["station", "forecast_time"])
+            ).drop("parameter")
+        else:
+            raise KeyError("Could not identify distribution")
+
+        dataset = xr.Dataset(
+            {
+                "spread": root_mean_ensemble_variance,
+                "error": rmse_of_ensemble_mean,
+            }
         )
 
-        ensemble_variance = np.square(ensemble_mean - preds).sum(dim="parameter") / (
-            preds.sizes["parameter"] - 1
-        )
-
-        root_mean_ensemble_variance = np.sqrt(
-            ensemble_variance.mean(dim=["station", "forecast_time"])
-        )
-
-        return root_mean_ensemble_variance / rmse_of_ensemble_mean
+        return dataset
 
 
 class SpreadErrorRatio(aq.Task):
     def requirements(self):
         run_ids = [
-            "006631e1f6a049aba484f7ec99f9ddaf",  # GDPS EMOS Reduce Lr Plateau MLP
-            "31213ca0ee91402b9798c82718946a7c",  # GDPS Quantile Reduce Lr Plateau MLP
-            "206af3ad4d75499bb104b127bdfdceba",  # GDPS Bernstein MLP
-            "bbd31bd582e04a29807a4d0715e00c4f",  # Linear EMOS,
-            "a65ad3d0748448d296987bf06a629b30",  # Linear Quantile
-            "b3c22606d4cd495eb562c7c0a4d091a6",  # Linear Bernstein
+            "b1c987e25c2d4b29ad2e2460fe7d167d",  # ENS10 MLP Quantile
+            "dd3831601ac24bb382cf3b6ca6a716b8",  # ENS10 MLP Bernstein
+            "7c6ab66a3c2a4c3fb8a19619e55d5a2c",  # ENS10 MLP EMOS,
+            "664df4da012e438bbb38ef276cb51825",  # GDPS EMOS Reduce Lr Plateau MLP
+            "5a44093d498f42029ad8fa7f2879d947",  # GDPS Quantile Reduce Lr Plateau MLP
+            "efeea97b936640ae9db2b486f8e63515",  # GDPS Bernstein MLP
+            "9601e53b536749b091085a0f9d2232f3",  # ENS10 Linear EMOS,
+            "1dd4dd38f3d04489a7a7d1f207639992",  # ENS10 Linear Quantile
+            "d1e6e36df70342a783864e88db0b4eae",  # ENS10 Linear Bernstein
+            "da827ce75ab44d7ba4bc234b0b117c8c",  # GDPS LINEAR EMOS
+            "d4679175723e4c3c81aa8be889fb95ca",  # GDPS LINEAR BERNSTEIN
+            "15717d13636b4e2a85506d307c0e82b8",  # GDPS LINEAR QUANTILE
         ]
 
         return [ModelSpreadErrorRatio(run_id=i, test_set=True) for i in run_ids]
@@ -893,10 +913,28 @@ class SpreadErrorRatio(aq.Task):
     def run(self, requirements) -> pd.DataFrame:
         dfs = []
         for model_stats in requirements:
-            df = model_stats.to_dataframe(name="spread_error_ratio")
+            ratio = model_stats.spread / model_stats.error
+            df = ratio.to_dataframe(name="spread_error_ratio")
             dfs.append(df)
 
-        return pd.concat(dfs)
+        df = pd.concat(dfs).reset_index()
+        df = df[(df["dataset"] != "gdps_prebatch_24h") | (df.step > pd.to_timedelta(0))]
+
+        return df
+
+
+class SpreadWithTime(SpreadErrorRatio):
+    def run(self, requirements):
+        dfs = []
+        for model_stats in requirements:
+            df = model_stats.spread.to_dataframe("spread")
+            dfs.append(df)
+
+        df = pd.concat(dfs).reset_index()
+
+        df = df[(df["dataset"] != "gdps_prebatch_24h") | (df.step > pd.to_timedelta(0))]
+
+        return df
 
 
 class JointTrainingGain(aq.Task):
@@ -906,7 +944,8 @@ class JointTrainingGain(aq.Task):
             "pp2023_paper_step_partition"
         )
         partition_runs = client.search_runs(
-            experiment_ids=[partition_experiment.experiment_id]
+            experiment_ids=[partition_experiment.experiment_id],
+            max_results=5000,
         )
 
         partition_run_ids = [r.info.run_id for r in partition_runs]
@@ -959,39 +998,57 @@ class StepCondition(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
         partition_experiment = client.get_experiment_by_name(
-            "pp2023_paper_step_partition"
+            "pp2023_mlp_condition_step_partition_03"
+        )
+        partition_experiment_2 = client.get_experiment_by_name(
+            "pp2023_condition_mlp_step_partition_02"
         )
         partition_runs = client.search_runs(
-            experiment_ids=[partition_experiment.experiment_id]
+            experiment_ids=[
+                partition_experiment.experiment_id,
+                partition_experiment_2.experiment_id,
+            ],
+            max_results=5000,
         )
 
         partition_run_ids = [r.info.run_id for r in partition_runs]
+
+        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_condition_step_05")
+        mlp_runs = client.search_runs(
+            experiment_ids=[mlp_experiment.experiment_id], max_results=5000
+        )
+        mlp_run_ids = [r.info.run_id for r in mlp_runs]
+
+        mlp_tasks = [ModelMetrics(run_id=i, test_set=True) for i in mlp_run_ids]
 
         partition_run_tasks = [
             ModelMetrics(run_id=i, test_set=True) for i in partition_run_ids
         ]
 
-        no_condition_run = ModelMetrics(
-            run_id="14a8b2308ce146c3af44705a43bad932", test_set=True
+        # Add linear runs
+        linear_experiment = client.get_experiment_by_name(
+            "pp2023_condition_linear_step_02"
         )
-        only_feature = ModelMetrics(
-            run_id="dc32dbffc8814d14a05e18ba9dae36d5", test_set=True
+        linear_runs = client.search_runs(
+            experiment_ids=[linear_experiment.experiment_id], max_results=5000
         )
-        only_embedding = ModelMetrics(
-            run_id="f88f2177b5d14a8c885b9d3027e47ff1", test_set=True
-        )
-        both = ModelMetrics(run_id="d687fba27d584681b0e68ecc969b0cac", test_set=True)
+
+        linear_run_ids = [r.info.run_id for r in linear_runs]
+
+        linear_run_tasks = [
+            ModelMetrics(run_id=i, test_set=True) for i in linear_run_ids
+        ]
 
         return [
-            no_condition_run,
-            only_feature,
-            only_embedding,
-            both,
+            linear_run_tasks,
+            mlp_tasks,
             *partition_run_tasks,
         ]
 
     def run(self, requirements):
         (
+            linear_runs,
+            mlp_runs,
             no_condition,
             only_feature,
             only_embedding,
@@ -999,32 +1056,98 @@ class StepCondition(aq.Task):
             *partitioned_runs,
         ) = requirements
 
-        no_condition_df = no_condition.mean(
-            dim=["forecast_time", "station"]
-        ).to_dataframe()
-        no_condition_df["condition"] = "none"
+        # no_condition_df = no_condition.mean(
+        #     dim=["forecast_time", "station"]
+        # ).to_dataframe()
+        # no_condition_df["condition"] = "none"
 
-        only_feature_df = only_feature.mean(
-            dim=["forecast_time", "station"]
-        ).to_dataframe()
-        only_feature_df["condition"] = "feature"
+        # only_feature_df = only_feature.mean(
+        #     dim=["forecast_time", "station"]
+        # ).to_dataframe()
+        # only_feature_df["condition"] = "feature"
 
-        only_embedding_df = only_embedding.mean(
-            dim=["forecast_time", "station"]
-        ).to_dataframe()
-        only_embedding_df["condition"] = "embedding"
+        # only_embedding_df = only_embedding.mean(
+        #     dim=["forecast_time", "station"]
+        # ).to_dataframe()
+        # only_embedding_df["condition"] = "embedding"
 
-        both_df = both.mean(dim=["forecast_time", "station"]).to_dataframe()
-        both_df["condition"] = "both"
+        # both_df = both.mean(dim=["forecast_time", "station"]).to_dataframe()
+        # both_df["condition"] = "both"
 
-        dfs = [no_condition_df, only_feature_df, only_embedding_df, both_df]
+        # dfs = [no_condition_df, only_feature_df, only_embedding_df, both_df]
+        dfs = []
 
-        for run in partitioned_runs:
+        for run in linear_runs:
             df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
-            df["condition"] = "partitioned"
             dfs.append(df)
 
-        return pd.concat(dfs)
+        for run in mlp_runs:
+            df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
+            dfs.append(df)
+
+        for run in partitioned_runs:
+            if "step" not in run.dims:
+                run = run.expand_dims("step")
+
+            df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
+            count = run.crps.count(dim=["forecast_time", "station"]).to_dataframe()
+            df["condition"] = "partitioned"
+            df["count"] = count["crps"]
+            dfs.append(df)
+
+        df = pd.concat(dfs)
+
+        df = df[~df["dataset"].str.startswith("gdps") | (df.index > pd.to_timedelta(0))]
+
+        df = df.replace(
+            {
+                "gdps_prebatch_partition": "gdps_prebatch_24h",
+            }
+        )
+
+        return df
+
+
+class FactorCompareStep(aq.Task):
+    EXPERIMENT_NAME = "pp2023_condition_mlp_step"
+
+    def requirements(self):
+        client = mlflow.client.MlflowClient()
+        experiment = client.get_experiment_by_name(self.EXPERIMENT_NAME)
+
+        runs = client.search_runs(
+            experiment_ids=[experiment.experiment_id],
+            max_results=5000,
+        )
+
+        run_ids = [r.info.run_id for r in runs]
+
+        run_tasks = [ModelMetrics(run_id=i, test_set=True) for i in run_ids]
+
+        return run_tasks
+
+    def run(self, requirements):
+        dfs = []
+        for dataset in requirements:
+            dataset = dataset.sel(step=dataset.step > pd.to_timedelta(0))
+            crps_df = dataset.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
+            count = dataset.crps.count(dim=["forecast_time", "station"]).to_dataframe()
+            crps_df["count"] = count["crps"]
+
+            dfs.append(crps_df)
+
+        df = pd.concat(dfs)
+
+        df = df[
+            ~df["dataset"].str.startswith("gdps")
+            | (df.index.get_level_values("step") > pd.to_timedelta(0))
+        ]
+
+        return df
+
+
+class FactorCompareStation(FactorCompareStep):
+    EXPERIMENT_NAME = "pp2023_condition_mlp_station_02"
 
 
 class SkillWithMembers(aq.Task):
@@ -1032,7 +1155,7 @@ class SkillWithMembers(aq.Task):
         client = mlflow.client.MlflowClient()
         partition_experiment = client.get_experiment_by_name("pp2023_paper_n_members")
         partition_runs = client.search_runs(
-            experiment_ids=[partition_experiment.experiment_id]
+            experiment_ids=[partition_experiment.experiment_id], max_results=5000
         )
 
         partition_run_ids = [r.info.run_id for r in partition_runs]
@@ -1254,7 +1377,9 @@ class ConditioningTableLinearStep(aq.Task):
         requirements = []
         for experiment_name in self.EXPERIMENT_NAME:
             experiment = client.get_experiment_by_name(experiment_name)
-            runs = client.search_runs(experiment_ids=[experiment.experiment_id])
+            runs = client.search_runs(
+                experiment_ids=[experiment.experiment_id], max_results=5000
+            )
 
             for r in runs:
                 requirements.append(ModelMetrics(run_id=r.info.run_id, test_set=True))
@@ -1349,7 +1474,7 @@ class ConditioningTableMLPStep(aq.Task):
             experiment = client.get_experiment_by_name(name)
             experiment_ids.append(experiment.experiment_id)
 
-        runs = client.search_runs(experiment_ids=experiment_ids)
+        runs = client.search_runs(experiment_ids=experiment_ids, max_results=5000)
 
         return [ModelMetrics(run_id=r.info.run_id, test_set=True) for r in runs]
 
@@ -1410,6 +1535,48 @@ class ConditioningTableMLPStep(aq.Task):
         )
 
         return dataframe
+
+
+class SpatialCRPS(aq.Task):
+    def requirements(self):
+        client = mlflow.client.MlflowClient()
+        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_02")
+        all_runs = [
+            r.info.run_id
+            for r in client.search_runs(
+                experiment_ids=[experiment_mlp.experiment_id], max_results=5000
+            )
+            if r.data.params["distribution_name"] == "bernstein"
+        ]
+
+        tasks = [ModelMetrics(i, test_set=True) for i in all_runs]
+
+        for dataset in ["gdps", "ens10"]:
+            tasks.append(NWPModelMetrics(dataset=dataset, test_set=True, debias=True))
+
+        return tasks
+
+    def run(self, requirements):
+        dfs = []
+
+        for metrics in requirements:
+            metrics = metrics.sel(
+                step=(
+                    (metrics.step > pd.to_timedelta(0))
+                    & (metrics.step <= pd.to_timedelta("2d"))
+                )
+            )
+
+            mean = metrics.crps.mean(dim=["forecast_time", "step"])
+
+            dfs.append(mean.to_dataframe())
+
+        df = pd.concat(dfs)
+        df["dataset"] = df["dataset"].replace(
+            {"gdps_prebatch_24h": "gdps", "ens10_prebatch": "ens10"}
+        )
+
+        return df
 
 
 class AllFigures(aq.Task):
