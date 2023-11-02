@@ -1,0 +1,10 @@
+n_steps: 3
+n_stations: 1189
+n_members: 10
+n_features: 88
+station_subset: ens10_stations_smc
+n_forecasts: 1
+maker:
+  _target_: pp2023.dataset.make_hdf5_datasets
+  hdf_file: ${oc.env:EDDIE_LOCAL_STORE}/pp2023/ens10_metar_smc.h5
+  n_members: ${..n_members}

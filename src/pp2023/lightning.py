@@ -1,20 +1,14 @@
 from typing import Any, Callable
 
-import math
 import omegaconf as oc
 import pandas as pd
 import pytorch_lightning as pl
-from pytorch_lightning.utilities.types import STEP_OUTPUT, TRAIN_DATALOADERS
 import torch
-from torch import Tensor
 import torch.nn as nn
-import torch.distributions as td
-import os
 
-from torch.optim.optimizer import Optimizer
 
 from .distribution.mapping import PP2023_DistributionMapping
-from .cli.base import build_dataloaders_from_config
+from .cli.base import build_datasets_from_config, build_dataloader_from_dataset
 
 
 class FromConfigDataModule(pl.LightningDataModule):
@@ -22,17 +16,27 @@ class FromConfigDataModule(pl.LightningDataModule):
         super().__init__()
         self.cfg = cfg
 
+        self.train_dataset, self.val_dataset, self.test_dataset = None, None, None
+
+    def setup(self, stage=None):
+        if self.train_dataset is None:
+            (
+                self.train_dataset,
+                self.val_dataset,
+                self.test_dataset,
+            ) = build_datasets_from_config(self.cfg)
+
     def train_dataloader(self):
-        loader, _, _ = build_dataloaders_from_config(self.cfg)
-        return loader
+        return build_dataloader_from_dataset(self.train_dataset, self.cfg, shuffle=True)
 
     def val_dataloader(self):
-        _, loader, _ = build_dataloaders_from_config(self.cfg)
-        return loader
+        return build_dataloader_from_dataset(self.val_dataset, self.cfg, shuffle=False)
 
     def test_dataloader(self):
-        _, _, loader = build_dataloaders_from_config(self.cfg)
-        return loader
+        return build_dataloader_from_dataset(self.test_dataset, self.cfg, shuffle=False)
+
+    def predict_dataloader(self):
+        return build_dataloader_from_dataset(self.test_dataset, self.cfg, shuffle=False)
 
 
 class PP2023Module(pl.LightningModule):
@@ -71,7 +75,11 @@ class PP2023Module(pl.LightningModule):
 
     def make_missing_obs_mask(self, batch):
         target = batch["target"]
-        mask = ~(torch.isnan(target).any(dim=-1))
+
+        if self.variable_idx is not None:
+            mask = ~(torch.isnan(target[..., self.variable_idx]))
+        else:
+            mask = ~(torch.isnan(target).any(dim=-1))
 
         return mask
 

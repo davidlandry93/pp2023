@@ -21,9 +21,14 @@ from eddie.ens10_metar.tasks import (
     RescaleStatistics,
     ValTestObs,
 )
-from eddie.pp2023.smc01 import SMC01_RescaleStatistics, SMC01_ValTestObs
+from eddie.pp2023.smc01 import (
+    SMC01_RescaleStatistics,
+    SMC01_ValTestObs,
+    SMC01_TrainObs,
+    SMC01_QualityControlMask,
+)
 
-from ..lightning import PP2023Module
+from ..lightning import PP2023Module, FromConfigDataModule
 from ..cli.base import build_model_from_config, build_dataloaders_from_config
 
 
@@ -56,7 +61,7 @@ def load_cfg_from_run(artifact_path: pathlib.Path, overrides=None) -> oc.DictCon
     if overrides is None:
         overrides = []
 
-    merged_overrides = [*run_overrides, "ex.dataset.maker.cache=False", *overrides]
+    merged_overrides = [*run_overrides, *overrides]
 
     with hydra.initialize_config_module("pp2023.conf", version_base="1.3"):
         cfg = hydra.compose("train", merged_overrides)
@@ -90,14 +95,15 @@ def predict(run_id, mlflow_tracking_uri=None, test_set=False, overrides=None):
     mlflow_run = get_run_object(run_id, mlflow_tracking_uri)
     cfg, module = get_model_from_id(mlflow_run, overrides=overrides)
 
-    _, val_loader, test_loader = build_dataloaders_from_config(cfg)
-    dataloader = test_loader if test_set else val_loader
+    datamodule = FromConfigDataModule(cfg)
 
     trainer = pl.Trainer(
         accelerator="auto",
     )
 
-    predictions = trainer.predict(module, dataloader, return_predictions=True)
+    predictions = trainer.predict(
+        module, datamodule=datamodule, return_predictions=True
+    )
 
     to_return = {}
     for k in predictions[0]:
@@ -353,6 +359,7 @@ class ModelPredictions(aq.Task):
             share_step=mlflow_run.data.params.get("model.share_step", None),
             share_station=mlflow_run.data.params.get("model.share_station", None),
             run_id=run_id,
+            validation_score=mlflow_run.data.metrics["min_crps"],
         )
 
         return rescaled_predictions
@@ -391,21 +398,29 @@ class SMC01_ModelPredictions(ModelPredictions):
 
 
 class NWPModelPredictions(aq.Task):
-    def __init__(self, dataset="gdps", test_set=False, debias=True):
+    def __init__(self, dataset="gdps", test_set=True, variant="debiased"):
         self.dataset = dataset
         self.test_set = test_set
-        self.debias = debias
+        self.variant = variant
 
     def requirements(self):
-        if self.dataset == "gdps":
-            return SMC01_ValTestObs()
-        elif self.dataset == "ens10":
-            return ValTestObs(station_set="ens10_stations_smc.csv")
-        else:
-            raise KeyError()
+        val_test_obs_req = (
+            SMC01_ValTestObs()
+            if self.dataset == "gdps"
+            else ValTestObs(station_set="ens10_stations_smc.csv")
+        )
+        requirements = [val_test_obs_req]
+        if self.variant == "climato":
+            if self.dataset != "gdps":
+                raise RuntimeError()
 
-    def run(self, preds_artifacts):
-        val_artifact, test_artifact = preds_artifacts.artifacts
+            requirements.append(MonthlyClimatologyModel(test_set=self.test_set))
+
+        return requirements
+
+    def run(self, requirements):
+        val_test_artifacts, *rest = requirements
+        val_artifact, test_artifact = val_test_artifacts.artifacts
 
         preds_artifact = test_artifact if self.test_set else val_artifact
         preds = xr.open_dataset(preds_artifact.path)
@@ -413,22 +428,92 @@ class NWPModelPredictions(aq.Task):
         if self.dataset == "gdps":
             preds = preds.isel(step=slice(0, 82, 8)).expand_dims(dim="number")
 
-        if self.debias:
+        if self.variant == "raw":
+            model_name = "raw_nwp"
+            distribution_name = "quantile"
+            preds = preds.rename({"number": "parameter"})
+        elif self.variant == "debiased":
+            model_name = "debiased"
+            distribution_name = "quantile"
+
             obs = preds[["obs_t2m"]].rename({"obs_t2m": "t2m"})
             bias = (obs - preds[["t2m"]]).mean(dim=["forecast_time", "number"])
 
-            preds = preds + bias
-
-        model_name = "debiased" if self.debias else "raw_nwp"
+            preds = (preds + bias).rename({"number": "parameter"})
+        elif self.variant == "climato":
+            model_name = "climato"
+            distribution_name = "normal"
+            preds = rest[0]
+        else:
+            raise KeyError("Unhandled model variant.")
 
         return (
             preds[["t2m"]]
             .assign_coords(
-                dataset=self.dataset, distribution="quantile", model=model_name
+                dataset=self.dataset, distribution=distribution_name, model=model_name
             )
-            .rename({"number": "parameter"})
             .transpose("forecast_time", "step", "station", "parameter")
         )
+
+
+class MonthlyClimatologyModel(aq.Task):
+    def __init__(self, test_set=True):
+        self.test_set = test_set
+
+    def requirements(self):
+        return [SMC01_TrainObs(), SMC01_ValTestObs()]
+
+    def run(self, requirements):
+        train_artifact, val_test_artifact = requirements
+        val_artifact, test_artifact = val_test_artifact.artifacts
+
+        train_obs = xr.open_dataset(train_artifact.path).sel(
+            step=[pd.to_timedelta(x, unit="D") for x in range(0, 11)]
+        )
+
+        obs_artifact = test_artifact if self.test_set else val_artifact
+        obs = xr.open_dataset(obs_artifact.path)
+
+        hours = []
+        for forecast_hour in [0, 12]:
+            months = []
+            for forecast_month in range(1, 13):
+                mean = train_obs.where(
+                    (train_obs.forecast_time.dt.hour == forecast_hour)
+                    & (train_obs.forecast_time.dt.month == forecast_month)
+                ).mean(dim="forecast_time")
+
+                std = train_obs.where(
+                    (train_obs.forecast_time.dt.hour == forecast_hour)
+                    & (train_obs.forecast_time.dt.month == forecast_month)
+                ).std(dim="forecast_time")
+
+                hour_month_climato = xr.combine_nested(
+                    [mean, std], concat_dim="parameter"
+                ).assign_coords(
+                    month=forecast_month, hour=forecast_hour, parameter=["loc", "scale"]
+                )
+                months.append(hour_month_climato)
+            hours.append(months)
+
+        monthly_climato = xr.combine_nested(hours, concat_dim=["hour", "month"])
+
+        climato_preds = (
+            monthly_climato.sel(
+                month=obs.forecast_time.dt.month,
+                hour=obs.forecast_time.dt.hour,
+                step=obs.step.isel(step=range(0, 82, 8)),
+                station=obs.station,
+            )
+            .assign_coords(model="monthly_climato", distribution="normal")
+            .drop(["t2m", "si10", "month", "hour"])
+            .rename({"obs_t2m": "t2m", "obs_si10": "si10"})
+        )
+
+        return climato_preds
+
+    def artifact(self):
+        return aq.LocalStoreArtifact("pp2023/predictions/smc01_monthly_climato.nc")
 
 
 SQRT_PI = math.sqrt(math.pi)
@@ -510,6 +595,7 @@ def requirements_for_run_metrics(run_id, test_set=True):
     if mlflow_run.data.params["dataset_name"].startswith("gdps"):
         model_prediction_task = SMC01_ModelPredictions(run_id=run_id, test_set=test_set)
         obs_task = SMC01_ValTestObs()
+        outlier_mask = SMC01_QualityControlMask()
     elif mlflow_run.data.params["dataset_name"].startswith("ens10"):
         model_prediction_task = ModelPredictions(
             run_id=run_id,
@@ -517,11 +603,9 @@ def requirements_for_run_metrics(run_id, test_set=True):
             test_set=test_set,
         )
         obs_task = ValTestObs(station_set="ens10_stations_smc.csv")
+        outlier_mask = None
 
-    return [
-        model_prediction_task,
-        obs_task,
-    ]
+    return [model_prediction_task, obs_task, outlier_mask]
 
 
 def do_one_chunk(inputs):
@@ -559,7 +643,9 @@ def crps_of_prediction(prediction: xr.DataArray, observation: xr.DataArray):
     return crps_xr, mse_xr, mae_xr, bias_xr
 
 
-def compute_model_metrics(preds: xr.Dataset, obs: xr.Dataset) -> xr.Dataset:
+def compute_model_metrics(
+    preds: xr.Dataset, obs: xr.Dataset, qc_mask: xr.Dataset
+) -> xr.Dataset:
     distribution = preds.coords["distribution"]
     dataset = preds.coords["dataset"]
 
@@ -574,17 +660,44 @@ def compute_model_metrics(preds: xr.Dataset, obs: xr.Dataset) -> xr.Dataset:
         mse = np.square(preds.sel(parameter="loc") - obs).drop_vars("parameter")
         mae = np.abs(preds.sel(parameter="loc") - obs).drop_vars("parameter")
         bias = (preds.sel(parameter="loc") - obs).drop_vars("parameter")
+        spread = (preds.sel(parameter="scale")).drop_vars("parameter")
     elif distribution in ["bernstein", "quantile"]:
         crps, mse, mae, bias = crps_of_prediction(preds, obs)
+
+        ensemble_variance = np.square(obs - preds).sum(dim="parameter") / (
+            preds.sizes["parameter"] - 1
+        )
+
+        spread = np.sqrt(ensemble_variance)
     elif distribution == "deterministic":
         crps = np.abs(preds - obs).squeeze()
         mse = np.square(preds - obs).squeeze()
         bias = (preds - obs).squeeze()
         mae = crps
+        spread = None
     else:
         raise KeyError("Could not compute crps for distribution type.")
 
-    return xr.Dataset({"crps": crps, "mse": mse, "bias": bias, "mae": mae})
+    dataset_dict = {"crps": crps, "mse": mse, "bias": bias, "mae": mae}
+    if spread is not None:
+        dataset_dict["spread"] = spread
+
+    metrics_dataset = xr.Dataset(dataset_dict)
+
+    valid_time = metrics_dataset.forecast_time + metrics_dataset.step
+    mask_for_metrics = qc_mask.sel(valid_time=valid_time)
+
+    for v in metrics_dataset.data_vars:
+        masked_dataarray = (
+            metrics_dataset[v]
+            .where(~mask_for_metrics)
+            .to_array()
+            .drop("variable")
+            .squeeze()
+        )
+
+        metrics_dataset[v] = masked_dataarray
+    return metrics_dataset
 
 
 class ModelMetrics(aq.Task):
@@ -596,13 +709,13 @@ class ModelMetrics(aq.Task):
         return requirements_for_run_metrics(self.run_id, self.test_set)
 
     def run(self, requirements) -> xr.Dataset:
-        preds, obs_artifact = requirements
+        preds, obs_artifact, qc_mask = requirements
         obs_artifact = (
             obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        return compute_model_metrics(preds, obs)
+        return compute_model_metrics(preds, obs, qc_mask)
 
     def artifact(self):
         set_label = "test" if self.test_set else "val"
@@ -610,10 +723,10 @@ class ModelMetrics(aq.Task):
 
 
 class NWPModelMetrics(aq.Task):
-    def __init__(self, dataset: str = "gdps", test_set=False, debias=True):
+    def __init__(self, dataset: str = "gdps", test_set=True, variant="debias"):
         self.dataset = dataset
         self.test_set = test_set
-        self.debias = debias
+        self.variant = variant
 
     def requirements(self):
         if self.dataset == "gdps":
@@ -625,22 +738,25 @@ class NWPModelMetrics(aq.Task):
 
         return [
             NWPModelPredictions(
-                dataset=self.dataset, test_set=self.test_set, debias=self.debias
+                dataset=self.dataset, test_set=self.test_set, variant=self.variant
             ),
             obs_task,
+            SMC01_QualityControlMask(),
         ]
 
     def run(self, reqs):
-        preds, obs_artifact = reqs
+        preds, obs_artifact, qc_mask = reqs
         obs_artifact = (
             obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        return compute_model_metrics(preds, obs)
+        return compute_model_metrics(preds, obs, qc_mask=qc_mask).assign_coords(
+            model=self.variant
+        )
 
     def artifact(self):
-        model_label = "debias" if self.debias else "raw_nwp"
+        model_label = self.variant
         set_label = "test" if self.test_set else "val"
 
         return aq.LocalStoreArtifact(
@@ -832,12 +948,24 @@ class DispersionByStep(aq.Task):
 
 
 class ModelSpreadErrorRatio(aq.Task):
-    def __init__(self, run_id: str, test_set: bool = True):
+    def __init__(
+        self, run_id: str = None, nwp_variant: str = None, test_set: bool = True
+    ):
         self.run_id = run_id
+        self.nwp_variant = nwp_variant
         self.test_set = test_set
 
+        if nwp_variant is not None and run_id is not None:
+            raise RuntimeError("run_id and nwp_variant are mutually exclusive")
+
     def requirements(self):
-        return requirements_for_run_metrics(self.run_id, self.test_set)
+        if self.nwp_variant:
+            return [
+                NWPModelPredictions(variant=self.nwp_variant, test_set=self.test_set),
+                SMC01_ValTestObs(),
+            ]
+        else:
+            return requirements_for_run_metrics(self.run_id, self.test_set)
 
     def run(self, requirements: tuple[xr.Dataset, Any]):
         preds, obs_artifact = requirements
@@ -846,14 +974,14 @@ class ModelSpreadErrorRatio(aq.Task):
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        distribution = preds.coords["distribution"]
+        distribution = preds.coords["distribution"].item()
         dataset = preds.coords["dataset"]
 
         # Only do t2m for now.
         preds = preds.t2m
         obs = obs.obs_t2m
 
-        if preds.distribution.item() in ["bernstein", "quantile"]:
+        if distribution in ["bernstein", "quantile"]:
             ensemble_mean = preds.mean(dim="parameter")
             rmse_of_ensemble_mean = np.sqrt(
                 np.square(ensemble_mean - obs).mean(dim=["station", "forecast_time"])
@@ -867,7 +995,7 @@ class ModelSpreadErrorRatio(aq.Task):
                 ensemble_variance.mean(dim=["station", "forecast_time"])
             )
 
-        elif preds.distribution.item() == "emos":
+        elif distribution in ["emos", "normal"]:
             rmse_of_ensemble_mean = np.sqrt(
                 np.square(preds.sel(parameter="loc") - obs).mean(
                     dim=["station", "forecast_time"]
@@ -908,7 +1036,17 @@ class SpreadErrorRatio(aq.Task):
             "15717d13636b4e2a85506d307c0e82b8",  # GDPS LINEAR QUANTILE
         ]
 
-        return [ModelSpreadErrorRatio(run_id=i, test_set=True) for i in run_ids]
+        nwp_variants = ["climato", "debiased"]
+
+        requirements = [
+            *[ModelSpreadErrorRatio(run_id=i, test_set=True) for i in run_ids],
+            *[
+                ModelSpreadErrorRatio(nwp_variant=x, test_set=True)
+                for x in nwp_variants
+            ],
+        ]
+
+        return requirements
 
     def run(self, requirements) -> pd.DataFrame:
         dfs = []
@@ -916,6 +1054,9 @@ class SpreadErrorRatio(aq.Task):
             ratio = model_stats.spread / model_stats.error
             df = ratio.to_dataframe(name="spread_error_ratio")
             dfs.append(df)
+
+            spread = model_stats.spread.to_dataframe(name="spread")
+            df["spread"] = spread["spread"]
 
         df = pd.concat(dfs).reset_index()
         df = df[(df["dataset"] != "gdps_prebatch_24h") | (df.step > pd.to_timedelta(0))]
@@ -1049,32 +1190,13 @@ class StepCondition(aq.Task):
         (
             linear_runs,
             mlp_runs,
-            no_condition,
-            only_feature,
-            only_embedding,
-            both,
+            # no_condition,
+            # only_feature,
+            # only_embedding,
+            # both,
             *partitioned_runs,
         ) = requirements
 
-        # no_condition_df = no_condition.mean(
-        #     dim=["forecast_time", "station"]
-        # ).to_dataframe()
-        # no_condition_df["condition"] = "none"
-
-        # only_feature_df = only_feature.mean(
-        #     dim=["forecast_time", "station"]
-        # ).to_dataframe()
-        # only_feature_df["condition"] = "feature"
-
-        # only_embedding_df = only_embedding.mean(
-        #     dim=["forecast_time", "station"]
-        # ).to_dataframe()
-        # only_embedding_df["condition"] = "embedding"
-
-        # both_df = both.mean(dim=["forecast_time", "station"]).to_dataframe()
-        # both_df["condition"] = "both"
-
-        # dfs = [no_condition_df, only_feature_df, only_embedding_df, both_df]
         dfs = []
 
         for run in linear_runs:
@@ -1153,7 +1275,7 @@ class FactorCompareStation(FactorCompareStep):
 class SkillWithMembers(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        partition_experiment = client.get_experiment_by_name("pp2023_paper_n_members")
+        partition_experiment = client.get_experiment_by_name("pp2023_add_members_02")
         partition_runs = client.search_runs(
             experiment_ids=[partition_experiment.experiment_id], max_results=5000
         )
@@ -1560,12 +1682,7 @@ class SpatialCRPS(aq.Task):
         dfs = []
 
         for metrics in requirements:
-            metrics = metrics.sel(
-                step=(
-                    (metrics.step > pd.to_timedelta(0))
-                    & (metrics.step <= pd.to_timedelta("2d"))
-                )
-            )
+            metrics = metrics.sel(step=((metrics.step > pd.to_timedelta(0))))
 
             mean = metrics.crps.mean(dim=["forecast_time", "step"])
 

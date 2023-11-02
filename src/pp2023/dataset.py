@@ -2,6 +2,7 @@ from typing import Any
 
 import logging
 import os
+import h5py
 import math
 import numpy as np
 import pathlib
@@ -292,3 +293,62 @@ def make_one_step_datasets(input_dir, step_idx, **kwargs):
         TorchOnlyOneStepDataset(val, step_idx),
         TorchOnlyOneStepDataset(test, step_idx),
     ]
+
+
+class HDF5Dataset:
+    def __init__(self, path, subset, n_members=None, apply_qc_mask=False):
+        h5 = h5py.File(path, "r", rdcc_nbytes=1e9, rdcc_nslots=1e9)
+        self.group = h5[subset]
+        self.apply_qc_mask = apply_qc_mask
+
+        self.n_members = n_members
+
+    def __len__(self):
+        return self.group["features"].shape[0]
+
+    def __getitem__(self, idx):
+        example = {
+            k: torch.tensor(self.group[k][idx])
+            for k in self.group.keys()
+            if k != "forecast_sort_idx"
+        }
+
+        for k in ("month", "forecast_idx"):
+            example[k] = torch.broadcast_to(example[k], (example["features"].shape[0],))
+
+        example["day_of_year"] = example["day_of_year"].squeeze()
+        example["forecast_time"] = example["forecast_time"].squeeze()
+
+        if self.n_members is not None:
+            new_example = {}
+            for k in example:
+                if k in (
+                    "forecast",
+                    "features",
+                    "metadata_features",
+                ):
+                    new_example[k] = example[k][0 : self.n_members]
+                else:
+                    new_example[k] = example[k]
+
+            example = new_example
+
+        if self.apply_qc_mask:
+            qc_mask = example["qc_mask"]
+            new_target = torch.where(~qc_mask, example["target"], torch.nan)
+
+            example["target"] = new_target
+
+        return example
+
+
+def make_hdf5_datasets(hdf_file, **kwargs):
+    input_path = pathlib.Path(hdf_file)
+
+    datasets = [
+        HDF5Dataset(input_path, "train", **kwargs),
+        HDF5Dataset(input_path, "val", **kwargs),
+        HDF5Dataset(input_path, "test", **kwargs),
+    ]
+
+    return datasets

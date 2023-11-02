@@ -99,8 +99,6 @@ class ConstructiveQuantileMapping(PP2023_DistributionMapping):
         right_quantiles = mid_value + torch.cumsum(right_deltas, dim=-1)
         quantiles = torch.cat([left_quantiles, mid_value, right_quantiles], dim=-1)
 
-        print(quantiles.std())
-
         return QuantileDistribution(quantiles)
 
 

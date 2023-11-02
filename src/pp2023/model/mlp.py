@@ -33,6 +33,7 @@ class MLP(nn.Module):
         use_step_feature=True,
         use_spatial_features=True,
         use_batch_norm=False,
+        use_forecast_time_feature=False,
     ):
         super().__init__()
 
@@ -42,17 +43,21 @@ class MLP(nn.Module):
         self.use_metadata_features = use_metadata_features
         self.use_step_feature = use_step_feature
         self.use_spatial_features = use_spatial_features
+        self.use_forecast_time_feature = use_forecast_time_feature
 
         # Add to in_features because we concatenate with time features.
 
         if self.use_metadata_features:
-            in_features += 7
+            in_features += 8
 
             if not self.use_step_feature:
                 in_features -= 1
 
             if not self.use_spatial_features:
                 in_features -= 4
+
+            if not self.use_forecast_time_feature:
+                in_features -= 1
 
         embedding_blocks = [nn.Linear(in_features, embedding_size)]
         if embedding_activation:
@@ -98,7 +103,7 @@ class MLP(nn.Module):
         batch_size, n_members, n_stations, _ = batch["features"].shape
 
         if self.use_metadata_features:
-            features_to_keep = list(range(7))
+            features_to_keep = list(range(8))
 
             if not self.use_step_feature:
                 features_to_keep.remove(2)
@@ -109,11 +114,16 @@ class MLP(nn.Module):
                 features_to_keep.remove(5)
                 features_to_keep.remove(6)
 
+            if not self.use_forecast_time_feature:
+                features_to_keep.remove(7)
+
             metadata_features = batch["metadata_features"][..., features_to_keep]
 
             features = torch.cat([batch["features"], metadata_features], dim=-1)
         else:
             features = batch["features"]
+
+        breakpoint()
 
         projected_features = self.projection(features)
 

@@ -2,14 +2,14 @@ defaults:
 - submitit_slurm
 
 timeout_min: ${ex.timeout_min}
-cpus_per_task: 12
+cpus_per_task: 8
 tasks_per_node: 1
 nodes: 1
-gres: gpu:2
-partition: 
+gres: gpu:1
+partition: gpu_p5
 account: ovm@a100
 qos: ${ex.qos}
 constraint: a100
 setup:
   - source ${oc.env:HOME}/.bashrc
-  - conda activate ${conda_env_name} 
+  - conda activate ${conda_env_name}
