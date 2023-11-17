@@ -322,6 +322,11 @@ class ModelPredictions(aq.Task):
         return RescaleStatistics(self.station_set)
 
     def run(self, reqs: tuple[xr.Dataset]) -> xr.Dataset:
+        dataset_mappings = {
+            "gdps_hdf_24h": "gdps",
+            "gdps_hdf_24h_onestep": "gdps",
+        }
+
         rescale_statistics = reqs
 
         run_id = (
@@ -344,7 +349,7 @@ class ModelPredictions(aq.Task):
 
         rescaled_predictions = rescaled_predictions.assign_coords(
             distribution=mlflow_run.data.params["distribution_name"],
-            dataset=mlflow_run.data.params["dataset_name"],
+            dataset=dataset_mappings[mlflow_run.data.params["dataset_name"]],
             model=mlflow_run.data.params["model_name"],
             n_members=mlflow_run.data.params["dataset.n_members"],
             step_feature=mlflow_run.data.params.get("model.use_step_feature", None),
@@ -596,6 +601,9 @@ def requirements_for_run_metrics(run_id, test_set=True):
         model_prediction_task = SMC01_ModelPredictions(run_id=run_id, test_set=test_set)
         obs_task = SMC01_ValTestObs()
         outlier_mask = SMC01_QualityControlMask()
+
+        requirements = [model_prediction_task, obs_task, outlier_mask]
+
     elif mlflow_run.data.params["dataset_name"].startswith("ens10"):
         model_prediction_task = ModelPredictions(
             run_id=run_id,
@@ -603,9 +611,9 @@ def requirements_for_run_metrics(run_id, test_set=True):
             test_set=test_set,
         )
         obs_task = ValTestObs(station_set="ens10_stations_smc.csv")
-        outlier_mask = None
+        requirements = [model_prediction_task, obs_task]
 
-    return [model_prediction_task, obs_task, outlier_mask]
+    return requirements
 
 
 def do_one_chunk(inputs):
@@ -644,7 +652,7 @@ def crps_of_prediction(prediction: xr.DataArray, observation: xr.DataArray):
 
 
 def compute_model_metrics(
-    preds: xr.Dataset, obs: xr.Dataset, qc_mask: xr.Dataset
+    preds: xr.Dataset, obs: xr.Dataset, qc_mask: xr.Dataset = None
 ) -> xr.Dataset:
     distribution = preds.coords["distribution"]
     dataset = preds.coords["dataset"]
@@ -685,7 +693,11 @@ def compute_model_metrics(
     metrics_dataset = xr.Dataset(dataset_dict)
 
     valid_time = metrics_dataset.forecast_time + metrics_dataset.step
-    mask_for_metrics = qc_mask.sel(valid_time=valid_time)
+
+    if qc_mask is not None:
+        mask_for_metrics = qc_mask.sel(valid_time=valid_time)
+    else:
+        mask_for_metrics = xr.zeros_like(valid_time, dtype=bool)
 
     for v in metrics_dataset.data_vars:
         masked_dataarray = (
@@ -709,13 +721,20 @@ class ModelMetrics(aq.Task):
         return requirements_for_run_metrics(self.run_id, self.test_set)
 
     def run(self, requirements) -> xr.Dataset:
-        preds, obs_artifact, qc_mask = requirements
+        if len(requirements) == 3:
+            preds, obs_artifact, qc_mask = requirements
+        else:
+            preds, obs_artifact = requirements
+            qc_mask = None
+
         obs_artifact = (
             obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        return compute_model_metrics(preds, obs, qc_mask)
+        metrics = compute_model_metrics(preds, obs, qc_mask)
+
+        return metrics
 
     def artifact(self):
         set_label = "test" if self.test_set else "val"
@@ -773,8 +792,9 @@ class TableCRPS(aq.Task):
 
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_02")
-        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_03")
+        experiment_mlp = client.get_experiment_by_name("pp2023_paper_mlp_table_03")
+        experiment_mlp_2 = client.get_experiment_by_name("pp2023_paper_mlp_table_03")
+        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_04")
         all_runs = [
             r.info.run_id
             for r in client.search_runs(
@@ -788,12 +808,12 @@ class TableCRPS(aq.Task):
 
         runs_tasks = [ModelMetrics(run_id=run_id, test_set=True) for run_id in all_runs]
 
-        for dataset in ["gdps", "ens10"]:
+        for dataset in ["gdps"]:
             runs_tasks.append(
-                NWPModelMetrics(dataset=dataset, test_set=True, debias=False)
+                NWPModelMetrics(dataset=dataset, test_set=True, variant="raw")
             )
             runs_tasks.append(
-                NWPModelMetrics(dataset=dataset, test_set=True, debias=True)
+                NWPModelMetrics(dataset=dataset, test_set=True, variant="debiased")
             )
 
         return runs_tasks
@@ -963,23 +983,34 @@ class ModelSpreadErrorRatio(aq.Task):
             return [
                 NWPModelPredictions(variant=self.nwp_variant, test_set=self.test_set),
                 SMC01_ValTestObs(),
+                SMC01_QualityControlMask(),
             ]
         else:
             return requirements_for_run_metrics(self.run_id, self.test_set)
 
     def run(self, requirements: tuple[xr.Dataset, Any]):
-        preds, obs_artifact = requirements
+        preds, obs_artifact, qc_mask = requirements
         obs_artifact = (
             obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
         )
-        obs = xr.open_dataset(obs_artifact.path)
+        obs = xr.open_dataset(obs_artifact.path).sel(step=preds.step)
+
+        qc_mask = qc_mask.to_array().squeeze().drop("variable")
+
+        valid_time = preds.forecast_time + preds.step
+        mask_for_preds = qc_mask.sel(valid_time=valid_time)
+        masked_preds = preds.t2m.where(~mask_for_preds)
+
+        valid_time = obs.forecast_time + obs.step
+        mask_for_obs = qc_mask.sel(valid_time=valid_time)
+        masked_obs = obs.obs_t2m.where(~mask_for_obs)
 
         distribution = preds.coords["distribution"].item()
         dataset = preds.coords["dataset"]
 
         # Only do t2m for now.
-        preds = preds.t2m
-        obs = obs.obs_t2m
+        preds = masked_preds
+        obs = masked_obs
 
         if distribution in ["bernstein", "quantile"]:
             ensemble_mean = preds.mean(dim="parameter")
@@ -1021,25 +1052,31 @@ class ModelSpreadErrorRatio(aq.Task):
 
 class SpreadErrorRatio(aq.Task):
     def requirements(self):
-        run_ids = [
-            "b1c987e25c2d4b29ad2e2460fe7d167d",  # ENS10 MLP Quantile
-            "dd3831601ac24bb382cf3b6ca6a716b8",  # ENS10 MLP Bernstein
-            "7c6ab66a3c2a4c3fb8a19619e55d5a2c",  # ENS10 MLP EMOS,
-            "664df4da012e438bbb38ef276cb51825",  # GDPS EMOS Reduce Lr Plateau MLP
-            "5a44093d498f42029ad8fa7f2879d947",  # GDPS Quantile Reduce Lr Plateau MLP
-            "efeea97b936640ae9db2b486f8e63515",  # GDPS Bernstein MLP
-            "9601e53b536749b091085a0f9d2232f3",  # ENS10 Linear EMOS,
-            "1dd4dd38f3d04489a7a7d1f207639992",  # ENS10 Linear Quantile
-            "d1e6e36df70342a783864e88db0b4eae",  # ENS10 Linear Bernstein
-            "da827ce75ab44d7ba4bc234b0b117c8c",  # GDPS LINEAR EMOS
-            "d4679175723e4c3c81aa8be889fb95ca",  # GDPS LINEAR BERNSTEIN
-            "15717d13636b4e2a85506d307c0e82b8",  # GDPS LINEAR QUANTILE
+        client = mlflow.client.MlflowClient()
+        linear_experiment = client.get_experiment_by_name("pp2023_linear_table_04")
+        mlp_experiment = client.get_experiment_by_name("pp2023_paper_mlp_table_03")
+
+        runs = client.search_runs(
+            experiment_ids=[
+                linear_experiment.experiment_id,
+                mlp_experiment.experiment_id,
+            ],
+            max_results=5000,
+        )
+
+        filtered_runs = [
+            r.info.run_id
+            for r in runs
+            if r.data.params["distribution_name"] != "deterministic"
         ]
 
         nwp_variants = ["climato", "debiased"]
 
         requirements = [
-            *[ModelSpreadErrorRatio(run_id=i, test_set=True) for i in run_ids],
+            *[
+                ModelSpreadErrorRatio(run_id=run_id, test_set=True)
+                for run_id in filtered_runs
+            ],
             *[
                 ModelSpreadErrorRatio(nwp_variant=x, test_set=True)
                 for x in nwp_variants
@@ -1059,7 +1096,7 @@ class SpreadErrorRatio(aq.Task):
             df["spread"] = spread["spread"]
 
         df = pd.concat(dfs).reset_index()
-        df = df[(df["dataset"] != "gdps_prebatch_24h") | (df.step > pd.to_timedelta(0))]
+        df = df[(df.step > pd.to_timedelta(0))]
 
         return df
 
@@ -1139,22 +1176,19 @@ class StepCondition(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
         partition_experiment = client.get_experiment_by_name(
-            "pp2023_mlp_condition_step_partition_03"
+            "pp2023_condition_mlp_step_partition_03"
         )
-        partition_experiment_2 = client.get_experiment_by_name(
-            "pp2023_condition_mlp_step_partition_02"
-        )
+
         partition_runs = client.search_runs(
             experiment_ids=[
                 partition_experiment.experiment_id,
-                partition_experiment_2.experiment_id,
             ],
             max_results=5000,
         )
 
         partition_run_ids = [r.info.run_id for r in partition_runs]
 
-        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_condition_step_05")
+        mlp_experiment = client.get_experiment_by_name("pp2023_condition_mlp_step_05")
         mlp_runs = client.search_runs(
             experiment_ids=[mlp_experiment.experiment_id], max_results=5000
         )
@@ -1166,64 +1200,39 @@ class StepCondition(aq.Task):
             ModelMetrics(run_id=i, test_set=True) for i in partition_run_ids
         ]
 
-        # Add linear runs
-        linear_experiment = client.get_experiment_by_name(
-            "pp2023_condition_linear_step_02"
-        )
-        linear_runs = client.search_runs(
-            experiment_ids=[linear_experiment.experiment_id], max_results=5000
-        )
-
-        linear_run_ids = [r.info.run_id for r in linear_runs]
-
-        linear_run_tasks = [
-            ModelMetrics(run_id=i, test_set=True) for i in linear_run_ids
-        ]
-
         return [
-            linear_run_tasks,
             mlp_tasks,
             *partition_run_tasks,
         ]
 
     def run(self, requirements):
         (
-            linear_runs,
             mlp_runs,
-            # no_condition,
-            # only_feature,
-            # only_embedding,
-            # both,
             *partitioned_runs,
         ) = requirements
 
         dfs = []
 
-        for run in linear_runs:
-            df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
-            dfs.append(df)
-
         for run in mlp_runs:
             df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
-            dfs.append(df)
+            dfs.append(df.reset_index())
 
         for run in partitioned_runs:
             if "step" not in run.dims:
                 run = run.expand_dims("step")
 
-            df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
-            count = run.crps.count(dim=["forecast_time", "station"]).to_dataframe()
+            df = run.mean(dim=["forecast_time", "station"]).to_dataframe()
+            count = run.count(dim=["forecast_time", "station"]).to_dataframe()
             df["condition"] = "partitioned"
             df["count"] = count["crps"]
-            dfs.append(df)
+            dfs.append(df.reset_index())
 
         df = pd.concat(dfs)
-
-        df = df[~df["dataset"].str.startswith("gdps") | (df.index > pd.to_timedelta(0))]
 
         df = df.replace(
             {
                 "gdps_prebatch_partition": "gdps_prebatch_24h",
+                "gdps_hdf_24h_onestep": "gdps_prebatch_24h",
             }
         )
 

@@ -8,5 +8,6 @@ use_member_embedding: false
 embedding_activation: false
 use_metadata_features: true
 use_spatial_features: true
-use_batch_norm: false
+use_batch_norm: true
 use_forecast_time_feature: true
+use_forecast_embedding: false

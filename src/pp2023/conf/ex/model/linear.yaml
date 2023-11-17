@@ -5,10 +5,8 @@ share_member: True
 share_station: False
 share_step: False
 share_time: True
-embedding_member: False
-embedding_station: False
-embedding_step: False
-embedding_time: False
+share_forecast_time: True
 use_metadata_features: True
 use_step_feature: True
 use_spatial_features: True
+use_forecast_time_feature: True

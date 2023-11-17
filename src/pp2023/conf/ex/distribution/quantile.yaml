@@ -1,4 +1,4 @@
-n_parameters: 16  # For every forecast, we need 4 parameters to initialize our distributions.
+n_parameters: 32  # For every forecast, we need 4 parameters to initialize our distributions.
 mapping:
   _target_: pp2023.distribution.mapping.NaiveQuantileMapping
   n_quantiles: ${..n_parameters}

@@ -296,19 +296,30 @@ def make_one_step_datasets(input_dir, step_idx, **kwargs):
 
 
 class HDF5Dataset:
-    def __init__(self, path, subset, n_members=None, apply_qc_mask=False):
+    def __init__(
+        self, path, subset, n_members=None, apply_qc_mask=False, step_idx=None
+    ):
         h5 = h5py.File(path, "r", rdcc_nbytes=1e9, rdcc_nslots=1e9)
         self.group = h5[subset]
         self.apply_qc_mask = apply_qc_mask
 
         self.n_members = n_members
 
+        if step_idx is not None:
+            self.step_indices = np.argwhere(
+                self.group["step_idx"][:] == step_idx
+            ).squeeze()
+        else:
+            self.step_indices = np.arange(self.group["step_idx"].shape[0])
+
+        _logger.info("Dataset has %d examples", self.step_indices.shape[0])
+
     def __len__(self):
-        return self.group["features"].shape[0]
+        return self.step_indices.shape[0]
 
     def __getitem__(self, idx):
         example = {
-            k: torch.tensor(self.group[k][idx])
+            k: torch.tensor(self.group[k][self.step_indices[idx]])
             for k in self.group.keys()
             if k != "forecast_sort_idx"
         }
