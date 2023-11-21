@@ -1,4 +1,4 @@
-_target_: pp2023.model.mlp.MLP
+_target_: pp2023.model.mlp.ConcatMLP
 embedding_size: 256
 n_blocks: 4
 use_station_embedding: true
