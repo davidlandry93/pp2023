@@ -8,6 +8,7 @@ import numpy as np
 import pathlib
 import torch
 import torch.utils.data
+import pandas as pd
 
 _logger = logging.getLogger(__name__)
 
@@ -297,29 +298,43 @@ def make_one_step_datasets(input_dir, step_idx, **kwargs):
 
 class HDF5Dataset:
     def __init__(
-        self, path, subset, n_members=None, apply_qc_mask=False, step_idx=None
+        self,
+        path,
+        subset,
+        n_members=None,
+        apply_qc_mask=False,
+        step_idx=None,
+        remove_gdps_6=False,
     ):
+        GDPS_7_START_DATE = pd.to_datetime("2019-07-03T12").value
+
         h5 = h5py.File(path, "r", rdcc_nbytes=1e9, rdcc_nslots=1e9)
         self.group = h5[subset]
         self.apply_qc_mask = apply_qc_mask
 
         self.n_members = n_members
 
-        if step_idx is not None:
-            self.step_indices = np.argwhere(
-                self.group["step_idx"][:] == step_idx
-            ).squeeze()
-        else:
-            self.step_indices = np.arange(self.group["step_idx"].shape[0])
+        example_mask = torch.ones(self.group["target"].shape[0], dtype=torch.bool)
 
-        _logger.info("Dataset has %d examples", self.step_indices.shape[0])
+        if step_idx is not None:
+            example_mask = example_mask & (self.group["step_idx"][:] == step_idx)
+
+        if remove_gdps_6:
+            forecast_dates = self.group["forecast_time"][:]
+            example_mask = example_mask & (
+                forecast_dates.squeeze() >= GDPS_7_START_DATE
+            )
+
+        self.indices = np.argwhere(example_mask).squeeze()
+
+        _logger.info("Dataset has %d examples", self.indices.shape[0])
 
     def __len__(self):
-        return self.step_indices.shape[0]
+        return self.indices.shape[0]
 
     def __getitem__(self, idx):
         example = {
-            k: torch.tensor(self.group[k][self.step_indices[idx]])
+            k: torch.tensor(self.group[k][self.indices[idx]])
             for k in self.group.keys()
             if k != "forecast_sort_idx"
         }

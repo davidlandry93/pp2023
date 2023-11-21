@@ -5,7 +5,9 @@ station_subset: gdps
 n_forecasts: 2
 n_variables: ${ex.n_variables}
 n_features: 20
+remove_gdps_6: false
 maker:
   _target_: pp2023.dataset.make_hdf5_datasets
   hdf_file: ${oc.env:EDDIE_LOCAL_STORE}/pp2023/smc01/dataset_24hrs.h5
   apply_qc_mask: true
+  remove_gdps_6: ${..remove_gdps_6}
