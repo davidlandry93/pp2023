@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import pandas as pd
 
 
 class TransposeBatchNorm(nn.Module):
@@ -33,6 +34,7 @@ class MLP(nn.Module):
         use_spatial_features=True,
         use_batch_norm=False,
         use_forecast_time_feature=False,
+        use_model_version_feature=False,
     ):
         super().__init__()
 
@@ -51,6 +53,7 @@ class MLP(nn.Module):
         self.use_step_feature = use_step_feature
         self.use_spatial_features = use_spatial_features
         self.use_forecast_time_feature = use_forecast_time_feature
+        self.use_model_version_feature = use_model_version_feature
 
         # Add to in_features because we concatenate with time features.
 
@@ -65,6 +68,9 @@ class MLP(nn.Module):
 
             if not self.use_forecast_time_feature:
                 in_features -= 1
+
+        if self.use_model_version_feature:
+            in_features += 1
 
         feature_embedding_size = self.feature_embedding_size(
             embedding_size, self.n_embeddings
@@ -163,6 +169,16 @@ class MLP(nn.Module):
             features = torch.cat([batch["features"], metadata_features], dim=-1)
         else:
             features = batch["features"]
+
+        if self.use_model_version_feature:
+            model_version_feature = (
+                batch["forecast_time"] >= pd.to_datetime("2019-07-03T12").value
+            )  # GDPS 7 start date.
+            model_version_feature = torch.broadcast_to(
+                model_version_feature.reshape(batch_size, 1, 1, 1),
+                (*features.shape[:-1], 1),
+            )
+            features = torch.cat([features, model_version_feature], dim=-1)
 
         projected_features = self.projection(features)
         pooled_features = projected_features.mean(dim=1)

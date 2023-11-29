@@ -1,0 +1,29 @@
+defaults:
+- dataset: gdps_hdf_24h_no6
+- model: linear
+- distribution: emos
+- optimizer: adam
+- scheduler: one_cycle
+- _self_
+
+timeout_min: 480
+
+batch_size: 64
+max_epochs: 200
+log_every_n_steps: 100
+early_stopping_patience: 500
+
+variable_idx: 0
+n_variables: 1
+
+optimizer:
+  lr:
+    1e-3
+
+distribution:
+  mapping:
+    predict_wind: False
+
+
+model:
+  n_variables: 1

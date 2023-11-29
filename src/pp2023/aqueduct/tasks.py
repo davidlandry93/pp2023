@@ -1,4 +1,5 @@
 from typing import Optional, Any
+from aqueduct.artifact import ArtifactSpec
 
 import hydra
 import math
@@ -325,6 +326,7 @@ class ModelPredictions(aq.Task):
         dataset_mappings = {
             "gdps_hdf_24h": "gdps",
             "gdps_hdf_24h_onestep": "gdps",
+            "gdps_hdf_24h_no6": "gdps",
         }
 
         rescale_statistics = reqs
@@ -792,9 +794,8 @@ class TableCRPS(aq.Task):
 
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        experiment_mlp = client.get_experiment_by_name("pp2023_paper_mlp_table_03")
-        experiment_mlp_2 = client.get_experiment_by_name("pp2023_paper_mlp_table_03")
-        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_04")
+        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_04")
+        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_05")
         all_runs = [
             r.info.run_id
             for r in client.search_runs(
@@ -863,7 +864,11 @@ class MetricsByStep(TableCRPS):
 
         df = pd.concat(dfs)
         df["dataset"] = df["dataset"].replace(
-            {"gdps_prebatch_24h": "gdps", "ens10_prebatch": "ens10"}
+            {
+                "gdps_prebatch_24h": "gdps",
+                "ens10_prebatch": "ens10",
+                "gdps_hdf_24h_no6": "gdps",
+            }
         )
 
         # Filter case where dataset is gdps and step is 0
@@ -988,6 +993,14 @@ class ModelSpreadErrorRatio(aq.Task):
         else:
             return requirements_for_run_metrics(self.run_id, self.test_set)
 
+    def artifact(self) -> ArtifactSpec | None:
+        label = self.run_id if self.run_id else self.nwp_variant
+        set_label = "test" if self.test_set else "val"
+
+        return aq.LocalStoreArtifact(
+            f"pp2023/metrics/spread_error_ratio/{label}_{set_label}.nc"
+        )
+
     def run(self, requirements: tuple[xr.Dataset, Any]):
         preds, obs_artifact, qc_mask = requirements
         obs_artifact = (
@@ -1053,6 +1066,9 @@ class ModelSpreadErrorRatio(aq.Task):
 class SpreadErrorRatio(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
+        # linear_experiment = client.get_experiment_by_name("pp2023_linear_table_05")
+        # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_table_04")
+
         linear_experiment = client.get_experiment_by_name("pp2023_linear_table_04")
         mlp_experiment = client.get_experiment_by_name("pp2023_paper_mlp_table_03")
 
@@ -1175,6 +1191,10 @@ class JointTrainingGain(aq.Task):
 class StepCondition(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
+        # partition_experiment = client.get_experiment_by_name(
+        #     "pp2023_mlp_step_condition_partition_06"
+        # )
+
         partition_experiment = client.get_experiment_by_name(
             "pp2023_condition_mlp_step_partition_03"
         )
@@ -1188,6 +1208,7 @@ class StepCondition(aq.Task):
 
         partition_run_ids = [r.info.run_id for r in partition_runs]
 
+        # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_step_condition_06")
         mlp_experiment = client.get_experiment_by_name("pp2023_condition_mlp_step_05")
         mlp_runs = client.search_runs(
             experiment_ids=[mlp_experiment.experiment_id], max_results=5000
@@ -1233,6 +1254,7 @@ class StepCondition(aq.Task):
             {
                 "gdps_prebatch_partition": "gdps_prebatch_24h",
                 "gdps_hdf_24h_onestep": "gdps_prebatch_24h",
+                "gdps_hdf_24h_no6": "gdps_prebatch_24h",
             }
         )
 
