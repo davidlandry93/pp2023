@@ -2,11 +2,13 @@ from typing import Any
 
 import logging
 import os
+import h5py
 import math
 import numpy as np
 import pathlib
 import torch
 import torch.utils.data
+import pandas as pd
 
 _logger = logging.getLogger(__name__)
 
@@ -292,3 +294,87 @@ def make_one_step_datasets(input_dir, step_idx, **kwargs):
         TorchOnlyOneStepDataset(val, step_idx),
         TorchOnlyOneStepDataset(test, step_idx),
     ]
+
+
+class HDF5Dataset:
+    def __init__(
+        self,
+        path,
+        subset,
+        n_members=None,
+        apply_qc_mask=False,
+        step_idx=None,
+        remove_gdps_6=False,
+    ):
+        GDPS_7_START_DATE = pd.to_datetime("2019-07-03T12").value
+
+        h5 = h5py.File(path, "r", rdcc_nbytes=1e9, rdcc_nslots=1e9)
+        self.group = h5[subset]
+        self.apply_qc_mask = apply_qc_mask
+
+        self.n_members = n_members
+
+        example_mask = torch.ones(self.group["target"].shape[0], dtype=torch.bool)
+
+        if step_idx is not None:
+            example_mask = example_mask & (self.group["step_idx"][:] == step_idx)
+
+        if remove_gdps_6:
+            forecast_dates = self.group["forecast_time"][:]
+            example_mask = example_mask & (
+                forecast_dates.squeeze() >= GDPS_7_START_DATE
+            )
+
+        self.indices = np.argwhere(example_mask).squeeze()
+
+        _logger.info("Dataset has %d examples", self.indices.shape[0])
+
+    def __len__(self):
+        return self.indices.shape[0]
+
+    def __getitem__(self, idx):
+        example = {
+            k: torch.tensor(self.group[k][self.indices[idx]])
+            for k in self.group.keys()
+            if k != "forecast_sort_idx"
+        }
+
+        for k in ("month", "forecast_idx"):
+            example[k] = torch.broadcast_to(example[k], (example["features"].shape[0],))
+
+        example["day_of_year"] = example["day_of_year"].squeeze()
+        example["forecast_time"] = example["forecast_time"].squeeze()
+
+        if self.n_members is not None:
+            new_example = {}
+            for k in example:
+                if k in (
+                    "forecast",
+                    "features",
+                    "metadata_features",
+                ):
+                    new_example[k] = example[k][0 : self.n_members]
+                else:
+                    new_example[k] = example[k]
+
+            example = new_example
+
+        if self.apply_qc_mask:
+            qc_mask = example["qc_mask"]
+            new_target = torch.where(~qc_mask, example["target"], torch.nan)
+
+            example["target"] = new_target
+
+        return example
+
+
+def make_hdf5_datasets(hdf_file, **kwargs):
+    input_path = pathlib.Path(hdf_file)
+
+    datasets = [
+        HDF5Dataset(input_path, "train", **kwargs),
+        HDF5Dataset(input_path, "val", **kwargs),
+        HDF5Dataset(input_path, "test", **kwargs),
+    ]
+
+    return datasets

@@ -1,20 +1,14 @@
 from typing import Any, Callable
 
-import math
 import omegaconf as oc
 import pandas as pd
 import pytorch_lightning as pl
-from pytorch_lightning.utilities.types import STEP_OUTPUT, TRAIN_DATALOADERS
 import torch
-from torch import Tensor
 import torch.nn as nn
-import torch.distributions as td
-import os
 
-from torch.optim.optimizer import Optimizer
 
 from .distribution.mapping import PP2023_DistributionMapping
-from .cli.base import build_dataloaders_from_config
+from .cli.base import build_datasets_from_config, build_dataloader_from_dataset
 
 
 class FromConfigDataModule(pl.LightningDataModule):
@@ -22,17 +16,27 @@ class FromConfigDataModule(pl.LightningDataModule):
         super().__init__()
         self.cfg = cfg
 
+        self.train_dataset, self.val_dataset, self.test_dataset = None, None, None
+
+    def setup(self, stage=None):
+        if self.train_dataset is None:
+            (
+                self.train_dataset,
+                self.val_dataset,
+                self.test_dataset,
+            ) = build_datasets_from_config(self.cfg)
+
     def train_dataloader(self):
-        loader, _, _ = build_dataloaders_from_config(self.cfg)
-        return loader
+        return build_dataloader_from_dataset(self.train_dataset, self.cfg, shuffle=True)
 
     def val_dataloader(self):
-        _, loader, _ = build_dataloaders_from_config(self.cfg)
-        return loader
+        return build_dataloader_from_dataset(self.val_dataset, self.cfg, shuffle=False)
 
     def test_dataloader(self):
-        _, _, loader = build_dataloaders_from_config(self.cfg)
-        return loader
+        return build_dataloader_from_dataset(self.test_dataset, self.cfg, shuffle=False)
+
+    def predict_dataloader(self):
+        return build_dataloader_from_dataset(self.test_dataset, self.cfg, shuffle=False)
 
 
 class PP2023Module(pl.LightningModule):
@@ -71,7 +75,11 @@ class PP2023Module(pl.LightningModule):
 
     def make_missing_obs_mask(self, batch):
         target = batch["target"]
-        mask = ~(torch.isnan(target).any(dim=-1))
+
+        if self.variable_idx is not None:
+            mask = ~(torch.isnan(target[..., self.variable_idx]))
+        else:
+            mask = ~(torch.isnan(target).any(dim=-1))
 
         return mask
 
@@ -79,25 +87,17 @@ class PP2023Module(pl.LightningModule):
         self,
         predicted_distribution,
         target,
-        log_step=False,
         logging_prefix="Train",
+        log_step=False,
     ):
         loss = predicted_distribution.loss(target)
         mean_loss = loss.mean()
-
-        if False:
-            self.log(
-                f"{logging_prefix}/Loss/All_step",
-                mean_loss,
-                on_step=True,
-                on_epoch=False,
-                rank_zero_only=True,
-            )
 
         self.log(
             f"{logging_prefix}/Loss/All",
             mean_loss,
             on_epoch=True,
+            on_step=log_step,
         )
 
         return mean_loss
@@ -121,7 +121,7 @@ class PP2023Module(pl.LightningModule):
 
         # There is an option to target only one variable in the distribution, so
         # we need to check if the crps actually contains multiple columns.
-        if aggregate_per_variable and crpss.shape[-1] > 1:
+        if aggregate_per_variable and crpss.shape[-1] > 1 and len(crpss.shape) > 1:
             self.validation_step_t2m_crpss.append(crpss[..., 0].mean())
             self.validation_step_si10_crpss.append(crpss[..., 1].mean())
 
@@ -131,15 +131,14 @@ class PP2023Module(pl.LightningModule):
         model_output = self.forward(batch)
 
         mask = self.make_missing_obs_mask(batch)
+
         masked_target = batch["target"][mask]
-        masked_forecast = batch["forecast"].transpose(1, 2)[
-            mask
-        ]  # Move the ensemble member dim so that we can keep it after mask application.
+        masked_forecast = batch["forecast"].transpose(1, 2)[mask]
         masked_model_output = model_output[mask]
 
-        if self.variable_idx:
-            masked_forecast = masked_forecast[..., [self.variable_idx]]
+        if self.variable_idx is not None:
             masked_target = masked_target[..., [self.variable_idx]]
+            masked_forecast = masked_forecast[..., [self.variable_idx]]
 
         predicted_distribution = self.distribution_map.make_distribution(
             masked_forecast, masked_model_output
@@ -155,7 +154,7 @@ class PP2023Module(pl.LightningModule):
         mask = self.make_missing_obs_mask(batch)
         masked_target = batch["target"][mask]
 
-        if self.variable_idx:
+        if self.variable_idx is not None:
             masked_target = masked_target[..., [self.variable_idx]]
 
         predicted_distribution = self.make_distribution(batch)
@@ -174,7 +173,7 @@ class PP2023Module(pl.LightningModule):
         mask = self.make_missing_obs_mask(batch)
         masked_target = batch["target"][mask]
 
-        if self.variable_idx:
+        if self.variable_idx is not None:
             masked_target = masked_target[..., [self.variable_idx]]
 
         predicted_distribution = self.make_distribution(batch)
@@ -198,15 +197,34 @@ class PP2023Module(pl.LightningModule):
         self.validation_step_crpss = []
 
     def predict_step(self, batch, batch_idx):
-        batch_size = batch["features"].shape[0]
+        predicted_distribution = self.make_distribution(batch)
+        distribution_dict = predicted_distribution.to_dict()
 
-        model_output = self.model(batch)
+        mask = self.make_missing_obs_mask(batch)
+
+        batch_size, n_stations = batch["target"].shape[0:2]
+
+        parameters = distribution_dict["parameters"]
+
+        forecast_time = (
+            batch["forecast_time"].unsqueeze(-1).expand(batch_size, n_stations)[mask]
+        )
+        step_idx = batch["step_idx"].unsqueeze(-1).expand(batch_size, n_stations)[mask]
+        step_ns = batch["step_ns"].unsqueeze(-1).expand(batch_size, n_stations)[mask]
+
+        station = (
+            torch.arange(0, n_stations, device=step_idx.device)
+            .unsqueeze(0)
+            .expand(batch_size, n_stations)[mask]
+        )
 
         return {
-            "forecast_time": batch["forecast_time"],
-            "step_idx": batch["step_idx"],
-            "step_ns": batch["step_ns"],
-            "prediction": model_output,
+            "forecast_time": forecast_time,
+            "step_idx": step_idx,
+            "step_ns": step_ns,
+            "station": station,
+            "distribution_type": distribution_dict["distribution_type"],
+            "parameters": parameters,
         }
 
     def on_train_epoch_end(self) -> None:

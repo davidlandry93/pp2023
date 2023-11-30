@@ -8,6 +8,24 @@ import torch.utils.data
 logger = logging.getLogger(__name__)
 
 
+def build_datasets_from_config(cfg: oc.DictConfig):
+    train_dataset, val_dataset, test_dataset = hydra.utils.instantiate(
+        cfg.ex.dataset.maker,
+    )
+
+    return train_dataset, val_dataset, test_dataset
+
+
+def build_dataloader_from_dataset(dataset, cfg, shuffle=False):
+    return torch.utils.data.DataLoader(
+        dataset,
+        shuffle=shuffle,
+        batch_size=cfg.ex.get("batch_size", None),
+        num_workers=cfg.num_workers,
+        # persistent_workers=True,
+    )
+
+
 def build_dataloaders_from_config(
     cfg: oc.DictConfig,
 ) -> tuple[
@@ -16,9 +34,7 @@ def build_dataloaders_from_config(
     torch.utils.data.DataLoader,
 ]:
     logger.info(f"Using dataset: {cfg.ex.dataset}")
-    train_dataset, val_dataset, test_dataset = hydra.utils.instantiate(
-        cfg.ex.dataset.maker,
-    )
+    train_dataset, val_dataset, test_dataset = build_datasets_from_config(cfg)
 
     local_rank = os.getenv("LOCAL_RANK", None)
 
@@ -46,7 +62,7 @@ def build_dataloaders_from_config(
         batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
         sampler=train_sampler,
-        # persistent_workers=True,
+        persistent_workers=True,
     )
 
     val_dataloader = torch.utils.data.DataLoader(
@@ -54,7 +70,7 @@ def build_dataloaders_from_config(
         batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
         sampler=val_sampler,
-        # persistent_workers=True,
+        persistent_workers=True,
     )
 
     test_dataloader = torch.utils.data.DataLoader(
@@ -62,7 +78,7 @@ def build_dataloaders_from_config(
         batch_size=cfg.ex.get("batch_size", None),
         num_workers=cfg.num_workers,
         sampler=test_sampler,
-        # persistent_workers=True,
+        persistent_workers=True,
     )
 
     return train_dataloader, val_dataloader, test_dataloader

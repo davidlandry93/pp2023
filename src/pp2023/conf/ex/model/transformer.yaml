@@ -1,8 +1,9 @@
 _target_: pp2023.model.transformer.TransformerModel
 embedding_size: 256
-n_blocks: 2
-n_heads: 16
-n_time_models: 12
+n_blocks: 4
+n_heads: 8
+n_time_models: 1
 add_meta_tokens: True
 select_member: mean
 activation_function: silu
+use_forecast_time_embedding: False

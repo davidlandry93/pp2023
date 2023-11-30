@@ -103,18 +103,19 @@ class TransformerModel(nn.Module):
         in_features: int,
         n_variables: int,
         n_parameters: int,
-        n_heads=4,
-        embedding_size=128,
+        n_heads=8,
+        embedding_size=256,
         n_blocks=4,
         dropout=0.0,
         add_meta_tokens=False,
         n_stations=None,
         n_steps=None,
-        n_forecasts=None,
+        n_forecasts=1,
         n_members=10,
         n_time_models=12,
-        select_member="first",
+        select_member="mean",
         activation_function="silu",
+        use_forecast_time_embedding=False,
     ):
         super().__init__()
 
@@ -132,6 +133,12 @@ class TransformerModel(nn.Module):
         self.station_embedding = nn.Parameter(
             torch.rand(n_stations + 1, embedding_size)
         )
+
+        self.forecast_time_embedding = nn.Parameter(
+            torch.rand(n_forecasts, embedding_size)
+        )
+
+        self.use_forecast_time_embedding = use_forecast_time_embedding
 
         self.time_model_span = math.ceil(N_DAYS_YEAR / n_time_models)
 
@@ -218,9 +225,11 @@ class TransformerModel(nn.Module):
         # Add tokens at the end of the sequence that describe the context (forecast id,
         # step id, etc).
         if self.add_meta_tokens:
+            n_meta_tokens = 2
             day_of_year_token = self.day_of_year_embedding[
                 day_of_year // self.time_model_span
             ]
+
             step_token = self.step_embedding[step_id]
 
             attention_in_features = torch.cat(
@@ -232,11 +241,20 @@ class TransformerModel(nn.Module):
                 dim=1,
             )
 
+            if self.use_forecast_time_embedding:
+                n_meta_tokens += 1
+                forecast_time_token = self.forecast_time_embedding[
+                    batch["forecast_idx"]
+                ]
+
+                attention_in_features = torch.cat(
+                    [attention_in_features, forecast_time_token], dim=1
+                )
+
         annotated_features = self.attention_layers(attention_in_features)
 
         # Remove the metadata tokens if necessary.
         if self.add_meta_tokens:
-            n_meta_tokens = 2
             annotated_features = annotated_features[:, :-n_meta_tokens]
 
         if self.select_member == "all":

@@ -149,6 +149,8 @@ def train_cli(cfg):
 
     try:
         datamodule = FromConfigDataModule(cfg)
+
+        datamodule.setup()
         steps_per_epoch = len(datamodule.train_dataloader())
 
         model = build_model_from_config(cfg)
