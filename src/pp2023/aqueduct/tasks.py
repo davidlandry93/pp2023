@@ -1330,11 +1330,10 @@ class SkillWithMembers(aq.Task):
 
 
 class CalibrationPlot(aq.Task):
-    def __init__(self, run_id: str, dataset="gdps", lead_time=2):
+    def __init__(self, run_id: str, dataset="gdps"):
         self.run_id = run_id
         self.test_set = True
         self.dataset = dataset
-        self.lead_time = lead_time
 
     def requirements(self):
         if self.dataset == "gdps":
@@ -1369,8 +1368,8 @@ class CalibrationPlot(aq.Task):
 
         obs = obs.reindex({"forecast_time": preds.forecast_time, "step": preds.step})
 
-        preds = preds.t2m.sel(step=pd.to_timedelta(self.lead_time, unit="days"))
-        obs = obs.obs_t2m.sel(step=pd.to_timedelta(self.lead_time, unit="days"))
+        preds = preds.t2m.sel(step=preds.step > pd.to_timedelta(0, unit="d"))
+        obs = obs.obs_t2m.sel(step=obs.step > pd.to_timedelta(0, unit="d"))
 
         bin_ids = (obs < preds).sum(dim="parameter")
         bin_ids_df = bin_ids.to_dataframe("bin_id")
@@ -1392,8 +1391,13 @@ class CalibrationPlot(aq.Task):
 
         return bin_ids_counts
 
+    def artifact(self):
+        return aq.LocalStoreArtifact(
+            f"pp2023/calibration_plots/{self.run_id}_{self.dataset}.parquet"
+        )
 
-def pit_transform_normal(preds: np.array, n_bins: int = 17) -> np.array:
+
+def pit_transform_normal(preds: np.array, n_bins: int = 32) -> np.array:
     loc = np.expand_dims(preds.sel(parameter="loc"), axis=-1)
     scale = np.expand_dims(preds.sel(parameter="scale"), axis=-1)
 
@@ -1429,20 +1433,12 @@ class CalibrationPlotNormal(CalibrationPlot):
 class CalibrationPlots(aq.Task):
     def requirements(self):
         return [
-            CalibrationPlot("206af3ad4d75499bb104b127bdfdceba"),  # MLP GDPS Bernstein
-            CalibrationPlot("31213ca0ee91402b9798c82718946a7c"),  # MLP GDPS Quantile
-            CalibrationPlotNormal(
-                "006631e1f6a049aba484f7ec99f9ddaf"
-            ),  # MLP GDPS Normal
-            CalibrationPlot(
-                "3f0ec04ff96944d9a531452de24e7bdb", dataset="ens10"
-            ),  # MLP ENS10 Bernstein
-            CalibrationPlot(
-                "ed36cb3ef34d413889a103008cd01713", dataset="ens10"
-            ),  # MLP ENS10 Quantile
-            CalibrationPlotNormal(
-                "b2d718d49f9748529da630d8ae211f24", dataset="ens10"
-            ),  # MLP ENS10 Normal
+            CalibrationPlot("92658845b11148adb2d94099b9690cf4"),  # MLP Bernstein
+            CalibrationPlot("903459468f6a4cc7b5b3843645646d1f"),  # MLP Quantile
+            CalibrationPlotNormal("32b5d9665cc94973a1bad146fba70d2a"),  # MLP Normal
+            CalibrationPlot("c10aea0736e94a0f88c65d07f0895056"),  # Linear Bernstein
+            CalibrationPlot("4c531e2ba032418d8bdc5a168d0b9571"),  # Linear Quantile
+            CalibrationPlotNormal("5152abc6624841b7ae7f7ef4c7798ec3"),  # Linear Normal
         ]
 
     def run(self, requirements) -> pd.DataFrame:

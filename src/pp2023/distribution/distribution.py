@@ -117,6 +117,7 @@ class QuantileDistribution(PP2023_Distribution):
 
         self.quantiles = quantiles
         self.loss_fn = loss_fn
+        self.sorted = sorted
 
     def loss(self, observation):
         match self.loss_fn:
@@ -128,7 +129,7 @@ class QuantileDistribution(PP2023_Distribution):
                 raise KeyError("Unknown loss function.")
 
     def crps(self, observation):
-        return crps_empirical(self.quantiles, observation, sorted=True)
+        return crps_empirical(self.quantiles, observation, sorted=self.sorted)
 
     def to_dict(self):
         return {"distribution_type": "quantile", "parameters": self.quantiles}
