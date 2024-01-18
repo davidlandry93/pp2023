@@ -1397,7 +1397,7 @@ class CalibrationPlot(aq.Task):
         )
 
 
-def pit_transform_normal(preds: np.array, n_bins: int = 32) -> np.array:
+def pit_transform_normal(preds: np.array, n_bins: int = 33) -> np.array:
     loc = np.expand_dims(preds.sel(parameter="loc"), axis=-1)
     scale = np.expand_dims(preds.sel(parameter="scale"), axis=-1)
 
@@ -1433,7 +1433,7 @@ class CalibrationPlotNormal(CalibrationPlot):
 class CalibrationPlots(aq.Task):
     def requirements(self):
         return [
-            CalibrationPlot("92658845b11148adb2d94099b9690cf4"),  # MLP Bernstein
+            CalibrationPlot("3e8bce7ca99b40afa98f780b3534a3c4"),  # MLP Bernstein
             CalibrationPlot("903459468f6a4cc7b5b3843645646d1f"),  # MLP Quantile
             CalibrationPlotNormal("32b5d9665cc94973a1bad146fba70d2a"),  # MLP Normal
             CalibrationPlot("c10aea0736e94a0f88c65d07f0895056"),  # Linear Bernstein

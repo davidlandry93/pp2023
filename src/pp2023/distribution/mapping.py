@@ -154,7 +154,7 @@ class DeterministicMapping(PP2023_DistributionMapping):
 
 
 class BernsteinQuantileFunctionMapping(PP2023_DistributionMapping):
-    N_SAMPLES = 100
+    N_SAMPLES = 98  # 98 quantiles = 99 bins --> dividable by 3.
 
     def __init__(self, n_parameters: int, use_base=True, predict_wind=True):
         self.degree = n_parameters - 1
@@ -169,6 +169,8 @@ class BernsteinQuantileFunctionMapping(PP2023_DistributionMapping):
         self, forecast: torch.Tensor, parameters: torch.Tensor
     ) -> QuantileDistribution:
         coefficients = parameters
+
+        coefficients, _ = torch.sort(coefficients, dim=-1)
 
         if self.use_base:
             coefficients += forecast.mean(dim=1).unsqueeze(-1)

@@ -113,8 +113,6 @@ class NormalDistribution(PP2023_Distribution):
 
 class QuantileDistribution(PP2023_Distribution):
     def __init__(self, quantiles, loss_fn="crps", sorted=False):
-        quantiles, _ = torch.sort(quantiles)
-
         self.quantiles = quantiles
         self.loss_fn = loss_fn
         self.sorted = sorted
@@ -122,7 +120,7 @@ class QuantileDistribution(PP2023_Distribution):
     def loss(self, observation):
         match self.loss_fn:
             case "crps":
-                return crps_empirical(self.quantiles, observation)
+                return crps_empirical(self.quantiles, observation, sorted=self.sorted)
             case "quantile_loss":
                 return quantile_loss(self.quantiles, observation)
             case _:
