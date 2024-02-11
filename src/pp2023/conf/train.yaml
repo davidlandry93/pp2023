@@ -25,6 +25,6 @@ ex:
   model_name: ${hydra:runtime.choices.ex/model}
   dataset_name: ${hydra:runtime.choices.ex/dataset}
 
-seed: 11347
+seed:
 limit_dataset:
 conda_env_name: pp2023

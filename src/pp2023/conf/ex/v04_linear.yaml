@@ -1,5 +1,5 @@
 defaults:
-- dataset: gdps_hdf_24h_no6
+- dataset: gdps_hdf_24h
 - model: linear
 - distribution: emos
 - optimizer: adam

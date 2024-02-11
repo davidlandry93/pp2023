@@ -1,7 +1,7 @@
 import torch
 
 
-def quantile_loss(quantile_values, obs, quantiles=None):
+def quantile_loss(quantile_values, obs, quantiles=None, sorted=False):
     """Args
     quantile_values: Tensor with the last dimension reserved for quantile values.
     obs: The observation to score against.
@@ -9,10 +9,13 @@ def quantile_loss(quantile_values, obs, quantiles=None):
         None, will consider the quantiles are uniformly spred from 0 to 1. Must
         have the same length as quantile_values.shape[-1]"""
 
+    if not sorted:
+        quantile_values, _ = torch.sort(quantile_values, dim=-1)
+
     if quantiles is None:
         n_quantiles = quantile_values.shape[-1]
-        lower_bound = 1.0 / (n_quantiles + 1)
-        upper_bound = 1.0 - lower_bound
+        lower_bound = 1.0 / (n_quantiles)
+        upper_bound = (n_quantiles - 1.0) / (n_quantiles)
         quantiles = torch.linspace(
             lower_bound, upper_bound, n_quantiles, device=quantile_values.device
         )

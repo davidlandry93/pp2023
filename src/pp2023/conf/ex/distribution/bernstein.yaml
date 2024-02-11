@@ -3,3 +3,4 @@ mapping:
   _target_: pp2023.distribution.mapping.BernsteinQuantileFunctionMapping
   n_parameters: ${..n_parameters}
   use_base: True 
+  loss: quantile_loss

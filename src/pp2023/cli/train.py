@@ -108,7 +108,8 @@ def train_cli(cfg):
     # See https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html.
     torch.set_float32_matmul_precision("high")
 
-    torch.manual_seed(cfg.seed)
+    if cfg.seed is not None:
+        torch.manual_seed(cfg.seed)
 
     mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
     if is_main_process():

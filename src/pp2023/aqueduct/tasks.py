@@ -1,5 +1,6 @@
 from typing import Optional, Any
 from aqueduct.artifact import ArtifactSpec
+from aqueduct.task_tree import TaskTree
 
 import hydra
 import math
@@ -327,6 +328,7 @@ class ModelPredictions(aq.Task):
             "gdps_hdf_24h": "gdps",
             "gdps_hdf_24h_onestep": "gdps",
             "gdps_hdf_24h_no6": "gdps",
+            "ens10_hdf": "ens10",
         }
 
         rescale_statistics = reqs
@@ -463,6 +465,94 @@ class NWPModelPredictions(aq.Task):
         )
 
 
+class NWPModelPredictionsDispatch(aq.Task):
+    """This task is a wrapper around NWPModelPredictions that allows us to dispatch.
+    Eventually, all of the dispatching logic should be moved into this task.
+    """
+
+    def __init__(self, dataset="gdps", test_set=True, variant="debiased"):
+        self.dataset = dataset
+        self.test_set = test_set
+        self.variant = variant
+
+    def requirements(self):
+        if self.variant == "naive":
+            return NaiveNWPModelPredictions(test_set=self.test_set)
+        else:
+            return NWPModelPredictions(
+                dataset=self.dataset, test_set=self.test_set, variant=self.variant
+            )
+
+    def run(self, requirements):
+        return requirements
+
+
+class NaiveNWPModelPredictions(aq.Task):
+    """NWP Model prediction, augmented with a naive uncertainty distribution made from
+    typical errors inside the train set."""
+
+    def __init__(self, test_set=True):
+        self.test_set = test_set
+
+    def requirements(self) -> TaskTree:
+        return [SMC01_TrainObs(), SMC01_ValTestObs()]
+
+    def run(self, reqs) -> xr.Dataset:
+        train_obs_artifact, val_test_obs_artifacts = reqs
+
+        train_obs = xr.open_dataset(train_obs_artifact.path)
+        val_obs_path = (
+            val_test_obs_artifacts.artifacts[1].path
+            if self.test_set
+            else val_test_obs_artifacts.artifacts[0].path
+        )
+        val_obs = xr.open_dataset(val_obs_path)
+
+        # Compute uncertainty estimate from the train set.
+        errors = train_obs.obs_t2m - train_obs.t2m
+
+        by_forecast_hour_mean = []
+        by_forecast_hour = []
+        for forecast_hour in [0, 12]:
+            group = errors.where(errors.forecast_time.dt.hour == forecast_hour).groupby(
+                "forecast_time.month"
+            )
+
+            forecast_hour_mean = group.mean(dim="forecast_time").assign_coords(
+                forecast_hour=forecast_hour
+            )
+            forecast_hour_std = group.std(dim="forecast_time")
+            forecast_hour_std = forecast_hour_std.assign_coords(
+                forecast_hour=forecast_hour
+            )
+            by_forecast_hour_mean.append(forecast_hour_mean)
+            by_forecast_hour.append(forecast_hour_std)
+
+        error_mean = xr.concat(by_forecast_hour_mean, dim="forecast_hour")
+        error_std = xr.concat(by_forecast_hour, dim="forecast_hour")
+
+        forecast_bias = error_mean.sel(
+            month=val_obs.forecast_time.dt.month,
+            forecast_hour=val_obs.forecast_time.dt.hour,
+        )
+        forecast_mean = val_obs.t2m + forecast_bias
+
+        forecast_std = error_std.sel(
+            month=val_obs.forecast_time.dt.month,
+            forecast_hour=val_obs.forecast_time.dt.hour,
+        )
+
+        naive_forecast = xr.concat(
+            [forecast_mean, forecast_std], dim="parameter"
+        ).assign_coords(
+            parameter=["loc", "scale"], distribution="normal", dataset="gdps"
+        )
+
+        naive_forecast = naive_forecast.isel(step=slice(0, 82, 8))
+
+        return xr.Dataset({"t2m": naive_forecast}).assign_coords(model="naive")
+
+
 class MonthlyClimatologyModel(aq.Task):
     def __init__(self, test_set=True):
         self.test_set = test_set
@@ -579,6 +669,36 @@ def crps_empirical_np(Q: np.array, y: np.array, sorted=False):
     return (left + right).sum(axis=-1)
 
 
+def crps_energy_np(Q, y, sorted=False):
+    """Energy CRPS as in equation (eNRG) of Zamo2018."""
+    lhs = np.abs(Q - y).mean(axis=-1)
+
+    inter_q_distances = (
+        np.abs(np.expand_dims(Q, axis=-1) - np.expand_dims(Q, axis=-2))
+        .sum(axis=-1)
+        .sum(axis=-1)
+    )
+
+    rhs = (1.0 / (2 * Q.shape[-1] * Q.shape[-1])) * inter_q_distances
+
+    return lhs - rhs
+
+
+def crps_fair_np(Q, y, sorted=False):
+    """Fair CRPS as in equation (eFAIR) of Zamo2018."""
+    lhs = np.abs(Q - y).mean(axis=-1)
+
+    inter_q_distances = (
+        np.abs(np.expand_dims(Q, axis=-1) - np.expand_dims(Q, axis=-2))
+        .sum(axis=-1)
+        .sum(axis=-1)
+    )
+
+    rhs = (1.0 / (2 * Q.shape[-1] * (Q.shape[-1] - 1))) * inter_q_distances
+
+    return lhs - rhs
+
+
 def crps_gaussian_np(Q, y):
     loc = Q.sel(parameter="loc")
     scale = Q.sel(parameter="scale")
@@ -618,9 +738,9 @@ def requirements_for_run_metrics(run_id, test_set=True):
     return requirements
 
 
-def do_one_chunk(inputs):
+def do_one_chunk(inputs, fn=crps_empirical_np):
     p_dataset, obs_dataset = inputs
-    crps = crps_empirical_np(p_dataset, obs_dataset)
+    crps = fn(p_dataset, obs_dataset)
     crps = xr.DataArray(crps, coords=obs_dataset.coords)
 
     return crps
@@ -642,6 +762,10 @@ def crps_of_prediction(prediction: xr.DataArray, observation: xr.DataArray):
         obs_dataset = observation.isel(forecast_time=slice(chunk_begin, chunk_end))
 
         crps_chunks.append(do_one_chunk((p_dataset, obs_dataset)))
+        # crps_fair_chunks.append(do_one_chunk((p_dataset, obs_dataset), fn=crps_fair_np))
+        # crps_energy_chunks.append(
+        #     do_one_chunk((p_dataset, obs_dataset), fn=crps_energy_np)
+        # )
         mse_chunks.append(np.square(p_dataset.mean(dim="parameter") - obs_dataset))
         mae_chunks.append(np.abs(p_dataset.median(dim="parameter") - obs_dataset))
         bias_chunks.append(p_dataset.mean(dim="parameter") - obs_dataset)
@@ -650,6 +774,7 @@ def crps_of_prediction(prediction: xr.DataArray, observation: xr.DataArray):
     mse_xr = xr.combine_nested(mse_chunks, concat_dim="forecast_time")
     mae_xr = xr.combine_nested(mae_chunks, concat_dim="forecast_time")
     bias_xr = xr.combine_nested(bias_chunks, concat_dim="forecast_time")
+    # crps_fair_xr = xr.combine_nested(crps_fair_chunks, concat_dim="forecast_time")
     return crps_xr, mse_xr, mae_xr, bias_xr
 
 
@@ -671,26 +796,37 @@ def compute_model_metrics(
         mae = np.abs(preds.sel(parameter="loc") - obs).drop_vars("parameter")
         bias = (preds.sel(parameter="loc") - obs).drop_vars("parameter")
         spread = (preds.sel(parameter="scale")).drop_vars("parameter")
+
+        dataset_dict = {
+            "crps": crps,
+            "mse": mse,
+            "bias": bias,
+            "mae": mae,
+            "spread": spread,
+        }
     elif distribution in ["bernstein", "quantile"]:
         crps, mse, mae, bias = crps_of_prediction(preds, obs)
+        n = preds.sizes["parameter"]
+        spread = np.sqrt(n / (n - 1)) * preds.std(dim="parameter")
 
-        ensemble_variance = np.square(obs - preds).sum(dim="parameter") / (
-            preds.sizes["parameter"] - 1
-        )
-
-        spread = np.sqrt(ensemble_variance)
+        dataset_dict = {
+            "crps": crps,
+            "mse": mse,
+            "bias": bias,
+            "mae": mae,
+            "spread": spread,
+            "composite_spread": compute_composite_spread(preds),
+        }
     elif distribution == "deterministic":
         crps = np.abs(preds - obs).squeeze()
         mse = np.square(preds - obs).squeeze()
         bias = (preds - obs).squeeze()
         mae = crps
         spread = None
+
+        dataset_dict = {"crps": crps, "mse": mse, "bias": bias, "mae": mae}
     else:
         raise KeyError("Could not compute crps for distribution type.")
-
-    dataset_dict = {"crps": crps, "mse": mse, "bias": bias, "mae": mae}
-    if spread is not None:
-        dataset_dict["spread"] = spread
 
     metrics_dataset = xr.Dataset(dataset_dict)
 
@@ -712,6 +848,27 @@ def compute_model_metrics(
 
         metrics_dataset[v] = masked_dataarray
     return metrics_dataset
+
+
+def compute_composite_spread(Q):
+    sorted_q = Q.isel(parameter=Q.argsort(axis=-1))
+    bin_width = sorted_q.isel(parameter=slice(1, None)) - sorted_q.isel(
+        parameter=slice(0, -1)
+    )
+    sorted_width = bin_width.isel(parameter=bin_width.argsort(axis=-1))
+
+    n_bins = bin_width.shape[-1]
+    n_for_metric = math.floor(n_bins * 0.683)
+
+    base_metric = sorted_width[..., :n_for_metric].sum(axis=-1)
+
+    leftover_cdf = 0.683 - (n_for_metric / n_bins)
+    last_column_ratio = leftover_cdf / (1 / n_bins)
+    last_column_value = sorted_width[..., n_for_metric] * last_column_ratio
+
+    full_metric = last_column_value + base_metric
+
+    return full_metric
 
 
 class ModelMetrics(aq.Task):
@@ -758,7 +915,7 @@ class NWPModelMetrics(aq.Task):
             KeyError()
 
         return [
-            NWPModelPredictions(
+            NWPModelPredictionsDispatch(
                 dataset=self.dataset, test_set=self.test_set, variant=self.variant
             ),
             obs_task,
@@ -794,8 +951,8 @@ class TableCRPS(aq.Task):
 
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_04")
-        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_05")
+        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_07")
+        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_06")
         all_runs = [
             r.info.run_id
             for r in client.search_runs(
@@ -816,6 +973,9 @@ class TableCRPS(aq.Task):
             runs_tasks.append(
                 NWPModelMetrics(dataset=dataset, test_set=True, variant="debiased")
             )
+            runs_tasks.append(
+                NWPModelMetrics(dataset=dataset, test_set=True, variant="naive")
+            )
 
         return runs_tasks
 
@@ -824,10 +984,6 @@ class TableCRPS(aq.Task):
         for full_metrics in requirements:
             for lead in ["first_two", "all"]:
                 metrics = full_metrics.sel(step=full_metrics.step > pd.to_timedelta(0))
-                if lead == "first_two":
-                    metrics = metrics.sel(
-                        step=metrics.step <= pd.to_timedelta(2, unit="d")
-                    )
 
                 run_id = metrics["run_id"].item() if "run_id" in metrics else None
 
@@ -986,7 +1142,9 @@ class ModelSpreadErrorRatio(aq.Task):
     def requirements(self):
         if self.nwp_variant:
             return [
-                NWPModelPredictions(variant=self.nwp_variant, test_set=self.test_set),
+                NWPModelPredictionsDispatch(
+                    variant=self.nwp_variant, test_set=self.test_set
+                ),
                 SMC01_ValTestObs(),
                 SMC01_QualityControlMask(),
             ]
@@ -1066,11 +1224,8 @@ class ModelSpreadErrorRatio(aq.Task):
 class SpreadErrorRatio(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        # linear_experiment = client.get_experiment_by_name("pp2023_linear_table_05")
-        # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_table_04")
-
-        linear_experiment = client.get_experiment_by_name("pp2023_linear_table_04")
-        mlp_experiment = client.get_experiment_by_name("pp2023_paper_mlp_table_03")
+        linear_experiment = client.get_experiment_by_name("pp2023_linear_table_06")
+        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_table_05")
 
         runs = client.search_runs(
             experiment_ids=[
@@ -1086,7 +1241,7 @@ class SpreadErrorRatio(aq.Task):
             if r.data.params["distribution_name"] != "deterministic"
         ]
 
-        nwp_variants = ["climato", "debiased"]
+        nwp_variants = ["naive"]
 
         requirements = [
             *[
@@ -1195,9 +1350,11 @@ class StepCondition(aq.Task):
         #     "pp2023_mlp_step_condition_partition_06"
         # )
 
-        partition_experiment = client.get_experiment_by_name(
-            "pp2023_condition_mlp_step_partition_03"
-        )
+        # partition_experiment = client.get_experiment_by_name(
+        #     "pp2023_condition_mlp_step_partition_03"
+        # )
+
+        partition_experiment = client.get_experiment_by_name("mlp_seq_07")
 
         partition_runs = client.search_runs(
             experiment_ids=[
@@ -1209,7 +1366,9 @@ class StepCondition(aq.Task):
         partition_run_ids = [r.info.run_id for r in partition_runs]
 
         # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_step_condition_06")
-        mlp_experiment = client.get_experiment_by_name("pp2023_condition_mlp_step_05")
+        # mlp_experiment = client.get_experiment_by_name("pp2023_condition_mlp_step_05")
+        # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_other_condition")
+        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_step_condition_08")
         mlp_runs = client.search_runs(
             experiment_ids=[mlp_experiment.experiment_id], max_results=5000
         )
@@ -1306,7 +1465,8 @@ class FactorCompareStation(FactorCompareStep):
 class SkillWithMembers(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        partition_experiment = client.get_experiment_by_name("pp2023_add_members_02")
+        # partition_experiment = client.get_experiment_by_name("pp2023_add_members_02")
+        partition_experiment = client.get_experiment_by_name("pp2023_mlp_n_members")
         partition_runs = client.search_runs(
             experiment_ids=[partition_experiment.experiment_id], max_results=5000
         )
@@ -1330,13 +1490,19 @@ class SkillWithMembers(aq.Task):
 
 
 class CalibrationPlot(aq.Task):
-    def __init__(self, run_id: str, dataset="gdps"):
+    def __init__(self, run_id=None, dataset="gdps", variant=None):
         self.run_id = run_id
         self.test_set = True
         self.dataset = dataset
+        self.variant = variant
 
     def requirements(self):
-        if self.dataset == "gdps":
+        if self.variant is not None:
+            model_prediction_task = NWPModelPredictionsDispatch(
+                test_set=self.test_set, variant=self.variant
+            )
+            obs_task = SMC01_ValTestObs()
+        elif self.dataset == "gdps":
             model_prediction_task = SMC01_ModelPredictions(
                 run_id=self.run_id, test_set=self.test_set
             )
@@ -1433,12 +1599,13 @@ class CalibrationPlotNormal(CalibrationPlot):
 class CalibrationPlots(aq.Task):
     def requirements(self):
         return [
-            CalibrationPlot("3e8bce7ca99b40afa98f780b3534a3c4"),  # MLP Bernstein
-            CalibrationPlot("903459468f6a4cc7b5b3843645646d1f"),  # MLP Quantile
-            CalibrationPlotNormal("32b5d9665cc94973a1bad146fba70d2a"),  # MLP Normal
-            CalibrationPlot("c10aea0736e94a0f88c65d07f0895056"),  # Linear Bernstein
-            CalibrationPlot("4c531e2ba032418d8bdc5a168d0b9571"),  # Linear Quantile
-            CalibrationPlotNormal("5152abc6624841b7ae7f7ef4c7798ec3"),  # Linear Normal
+            CalibrationPlotNormal(variant="naive"),  # Naive baseline.
+            CalibrationPlot("dea1011e2c784c5691ccdc9840ab87cb"),  # MLP Bernstein
+            CalibrationPlot("d9bb5a619c0f491ba0a8d7b225155da7"),  # MLP Quantile
+            CalibrationPlotNormal("0b19b63372d34e8dab1be9a3cd06dc1d"),  # MLP Normal
+            CalibrationPlot("035f895777c34dd0829f970111f5059f"),  # Linear Bernstein
+            CalibrationPlot("c0df917b1cb9436b9844b8220f91c2f1"),  # Linear Quantile
+            CalibrationPlotNormal("da92ed0357c94567bb2557cd8164f445"),  # Linear Normal
         ]
 
     def run(self, requirements) -> pd.DataFrame:
@@ -1610,12 +1777,17 @@ class ConditioningTableMLPStep(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
 
+        # experiment_names = [
+        #     "pp2023_mlp_condition_step_partition_03",
+        #     "pp2023_condition_mlp_step_partition_02",
+        #     "pp2023_mlp_condition_step_02",
+        #     "pp2023_mlp_condition_step_04",
+        #     "pp2023_condition_mlp_step",
+        # ]
+
         experiment_names = [
-            "pp2023_mlp_condition_step_partition_03",
-            "pp2023_condition_mlp_step_partition_02",
-            "pp2023_mlp_condition_step_02",
-            "pp2023_mlp_condition_step_04",
-            "pp2023_condition_mlp_step",
+            "pp2023_mlp_step",
+            "pp2023_mlp_other_condition",
         ]
 
         experiment_ids = []

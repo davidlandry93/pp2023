@@ -93,6 +93,7 @@ def build_model_from_config(cfg: oc.DictConfig) -> torch.nn.Module:
         n_forecasts=dataset_cfg.n_forecasts,
         n_steps=dataset_cfg.n_steps,
         n_stations=dataset_cfg.n_stations,
+        n_members=dataset_cfg.n_members,
     )
 
     return model

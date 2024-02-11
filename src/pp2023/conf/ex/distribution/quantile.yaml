@@ -4,3 +4,4 @@ mapping:
   _target_: pp2023.distribution.mapping.NaiveQuantileMapping
   n_quantiles: ${..n_parameters}
   use_base: True
+  loss: quantile_loss

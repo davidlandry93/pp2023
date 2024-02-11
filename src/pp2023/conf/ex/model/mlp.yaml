@@ -4,7 +4,7 @@ n_blocks: 4
 use_station_embedding: true
 use_step_embedding: true
 use_step_feature: true
-embedding_activation: false
+embedding_activation: true
 use_metadata_features: true
 use_spatial_features: true
 use_batch_norm: true

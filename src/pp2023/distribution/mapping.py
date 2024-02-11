@@ -23,7 +23,7 @@ class PP2023_DistributionMapping:
 
 
 class SimpleNormalMapping(PP2023_DistributionMapping):
-    def make_distribution(self, forecast, parameters):
+    def make_distribution(self, forecast, parameters, std_prior=None):
         forecast_mu = forecast.mean(dim=1)
 
         if forecast.shape[1] == 1:
@@ -49,11 +49,13 @@ class EMOSMapping(PP2023_DistributionMapping):
         # For this mapping, predict wind has no effect.
         self.predict_wind = predict_wind
 
-    def make_distribution(self, forecast, parameters):
+    def make_distribution(self, forecast, parameters, std_prior=None):
         forecast_mu = forecast.mean(dim=1)
 
-        if forecast.shape[1] == 1:
+        if forecast.shape[1] == 1 and std_prior is None:
             forecast_sigma = torch.full_like(forecast_mu, 1.0)
+        elif forecast.shape[1] == 1 and std_prior is not None:
+            forecast_sigma = torch.nan_to_num(std_prior, nan=0.5)
         else:
             forecast_sigma = forecast.std(dim=1)
 
@@ -68,6 +70,7 @@ class EMOSMapping(PP2023_DistributionMapping):
         log_sigma = sigma_coef * log_forecast_sigma + sigma_base
 
         sigma = torch.exp(log_sigma)
+        sigma = torch.clamp(sigma, min=1e-6)
 
         return NormalDistribution(mu, sigma)
 
@@ -77,7 +80,7 @@ class ConstructiveQuantileMapping(PP2023_DistributionMapping):
         self.initial = math.log(n_quantiles)
 
     def make_distribution(
-        self, forecast: torch.Tensor, parameters: torch.Tensor
+        self, forecast: torch.Tensor, parameters: torch.Tensor, std_prior=None
     ) -> QuantileDistribution:
         forecast_mean = forecast.mean(dim=1).unsqueeze(-1)
 
@@ -103,12 +106,13 @@ class ConstructiveQuantileMapping(PP2023_DistributionMapping):
 
 
 class NaiveQuantileMapping(PP2023_DistributionMapping):
-    def __init__(self, n_quantiles, predict_wind=True, use_base=True):
+    def __init__(self, n_quantiles, predict_wind=True, use_base=True, loss="crps"):
         self.n_quantiles = n_quantiles
         self.predict_wind = predict_wind
         self.use_base_quantiles = use_base
+        self.loss = loss
 
-    def make_distribution(self, forecast, parameters):
+    def make_distribution(self, forecast, parameters, std_prior=None):
         if self.use_base_quantiles:
             n_members = forecast.shape[1]
 
@@ -133,14 +137,14 @@ class NaiveQuantileMapping(PP2023_DistributionMapping):
 
         quantiles = torch.cat(vars_to_return, dim=-2)
 
-        return QuantileDistribution(quantiles)
+        return QuantileDistribution(quantiles, loss_fn=self.loss)
 
 
 class DeterministicMapping(PP2023_DistributionMapping):
     def __init__(self, predict_wind=True):
         self.predict_wind = predict_wind
 
-    def make_distribution(self, forecast, parameters):
+    def make_distribution(self, forecast, parameters, std_prior=None):
         t2m = parameters[..., 0, :]
         vars_params = [t2m]
 
@@ -156,17 +160,22 @@ class DeterministicMapping(PP2023_DistributionMapping):
 class BernsteinQuantileFunctionMapping(PP2023_DistributionMapping):
     N_SAMPLES = 98  # 98 quantiles = 99 bins --> dividable by 3.
 
-    def __init__(self, n_parameters: int, use_base=True, predict_wind=True):
+    def __init__(
+        self, n_parameters: int, use_base=True, predict_wind=True, loss="crps"
+    ):
         self.degree = n_parameters - 1
         self.use_base = use_base
         self.predict_wind = predict_wind
+        self.loss = loss
 
         polynomial_maker = bernstein_polynomial_torch(self.degree)
-        sample_points = torch.linspace(0.0, 1.0, self.N_SAMPLES)
+        sample_points = torch.linspace(
+            1.0 / self.N_SAMPLES, (self.N_SAMPLES - 1) / self.N_SAMPLES, self.N_SAMPLES
+        )
         self.poly_table = polynomial_maker(sample_points)
 
     def make_distribution(
-        self, forecast: torch.Tensor, parameters: torch.Tensor
+        self, forecast: torch.Tensor, parameters: torch.Tensor, std_prior=None
     ) -> QuantileDistribution:
         coefficients = parameters
 
@@ -179,4 +188,4 @@ class BernsteinQuantileFunctionMapping(PP2023_DistributionMapping):
             self.poly_table.to(parameters.device) * coefficients.unsqueeze(-1)
         ).sum(dim=-2)
 
-        return QuantileDistribution(quantile_values)
+        return QuantileDistribution(quantile_values, loss_fn=self.loss)
