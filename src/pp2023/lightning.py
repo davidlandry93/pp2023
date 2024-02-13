@@ -136,14 +136,14 @@ class PP2023Module(pl.LightningModule):
         masked_forecast = batch["forecast"].transpose(1, 2)[mask]
         masked_model_output = model_output[mask]
 
-        std_prior = batch["std_prior"][mask].unsqueeze(-1)
+        std_prior = batch["std_prior"].squeeze()[mask].unsqueeze(-1)
 
         if self.variable_idx is not None:
             masked_target = masked_target[..., [self.variable_idx]]
             masked_forecast = masked_forecast[..., [self.variable_idx]]
 
         predicted_distribution = self.distribution_map.make_distribution(
-            masked_forecast, masked_model_output, std_prior=None
+            masked_forecast, masked_model_output, std_prior=std_prior
         )
 
         return predicted_distribution

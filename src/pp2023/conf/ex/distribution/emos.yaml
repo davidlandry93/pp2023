@@ -1,3 +1,4 @@
 n_parameters: 4
 mapping:
   _target_: pp2023.distribution.mapping.EMOSMapping
+  use_std_prior: False

@@ -39,6 +39,7 @@ class MLP(nn.Module):
         use_batch_norm=False,
         use_forecast_time_feature=False,
         use_model_version_feature=False,
+        use_std_prior=False,
     ):
         super().__init__()
 
@@ -59,11 +60,12 @@ class MLP(nn.Module):
         self.use_forecast_time_feature = use_forecast_time_feature
         self.use_model_version_feature = use_model_version_feature
         self.embedding_activation = embedding_activation
+        self.use_std_prior = use_std_prior
 
         # Add to in_features because we concatenate with time features.
 
         if self.use_metadata_features:
-            in_features += 8
+            in_features += 9
 
             if not self.use_step_feature:
                 in_features -= 1
@@ -72,6 +74,9 @@ class MLP(nn.Module):
                 in_features -= 4
 
             if not self.use_forecast_time_feature:
+                in_features -= 1
+
+            if not self.use_std_prior:
                 in_features -= 1
 
         if self.use_model_version_feature:
@@ -158,7 +163,7 @@ class MLP(nn.Module):
         batch_size, n_members, n_stations, _ = batch["features"].shape
 
         if self.use_metadata_features:
-            features_to_keep = list(range(8))
+            features_to_keep = list(range(9))
 
             if not self.use_step_feature:
                 features_to_keep.remove(2)
@@ -171,6 +176,9 @@ class MLP(nn.Module):
 
             if not self.use_forecast_time_feature:
                 features_to_keep.remove(7)
+
+            if not self.use_std_prior:
+                features_to_keep.remove(8)
 
             metadata_features = batch["metadata_features"][..., features_to_keep]
 

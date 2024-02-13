@@ -10,3 +10,4 @@ use_metadata_features: True
 use_step_feature: True
 use_spatial_features: True
 use_forecast_time_feature: True
+use_std_prior: False

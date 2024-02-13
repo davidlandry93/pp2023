@@ -25,6 +25,7 @@ class Linear(nn.Module):
         use_step_feature=True,
         use_spatial_features=True,
         use_forecast_time_feature=True,
+        use_std_prior=False,
     ):
         super().__init__()
         self.time_model_span = math.ceil(N_DAYS_YEAR / n_time_models)
@@ -39,6 +40,7 @@ class Linear(nn.Module):
         self.use_spatial_features = use_spatial_features
         self.use_step_feature = use_step_feature
         self.use_forecast_time_feature = use_forecast_time_feature
+        self.use_std_prior = use_std_prior
 
         model_size_station = 1 if share_station else n_stations
         model_size_member = 1 if share_member else n_members
@@ -47,7 +49,7 @@ class Linear(nn.Module):
         model_size_forecast_time = 1 if share_forecast_time else n_forecasts
 
         if use_metadata_features:
-            in_features += 8
+            in_features += 9
 
         if not use_step_feature:
             in_features -= 1
@@ -56,6 +58,9 @@ class Linear(nn.Module):
             in_features -= 4
 
         if not use_forecast_time_feature:
+            in_features -= 1
+
+        if not use_std_prior:
             in_features -= 1
 
         self.coefs = nn.Parameter(
@@ -102,7 +107,7 @@ class Linear(nn.Module):
             forecast_time_idx = batch["forecast_idx"].squeeze()
 
         if self.use_metadata_features:
-            features_to_keep = list(range(8))
+            features_to_keep = list(range(9))
 
             if not self.use_spatial_features:
                 features_to_keep.remove(3)
@@ -115,6 +120,9 @@ class Linear(nn.Module):
 
             if not self.use_forecast_time_feature:
                 features_to_keep.remove(7)
+
+            if not self.use_std_prior:
+                features_to_keep.remove(8)
 
             metadata_features = batch["metadata_features"][..., features_to_keep]
 

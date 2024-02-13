@@ -44,7 +44,7 @@ class SimpleNormalMapping(PP2023_DistributionMapping):
         return NormalDistribution(mu, sigma)
 
 
-class EMOSMapping(PP2023_DistributionMapping):
+class NaiveMapping(PP2023_DistributionMapping):
     def __init__(self, predict_wind=True):
         # For this mapping, predict wind has no effect.
         self.predict_wind = predict_wind
@@ -52,19 +52,71 @@ class EMOSMapping(PP2023_DistributionMapping):
     def make_distribution(self, forecast, parameters, std_prior=None):
         forecast_mu = forecast.mean(dim=1)
 
-        if forecast.shape[1] == 1 and std_prior is None:
+        if std_prior is None:
+            raise ValueError("NaiveMapping must have std prior.")
+
+        # If no prior is available for that station-month, revert to yearly std prior.
+        # This is a rare case in GDPS.
+        std_prior = torch.nan_to_num(std_prior, nan=1.0)
+
+        mu_coef = parameters[..., 0] + 1.0
+        mu_base = parameters[..., 1]
+
+        mu = mu_coef * forecast_mu + mu_base
+
+        return NormalDistribution(mu, std_prior)
+
+
+class EMOSMapping(PP2023_DistributionMapping):
+    def __init__(self, predict_wind=True, use_std_prior=False):
+        # For this mapping, predict wind has no effect.
+        self.predict_wind = predict_wind
+        self.use_std_prior = use_std_prior
+
+    def make_distribution(self, forecast, parameters, std_prior=None):
+        forecast_mu = forecast.mean(dim=1)
+
+        if forecast.shape[1] == 1 and not self.use_std_prior:
             forecast_sigma = torch.full_like(forecast_mu, 1.0)
-        elif forecast.shape[1] == 1 and std_prior is not None:
+            sigma_coef = 0
+        elif forecast.shape[1] == 1 and self.use_std_prior:
             forecast_sigma = torch.nan_to_num(std_prior, nan=0.5)
+            sigma_coef = parameters[..., 2] + 1.0
         else:
             forecast_sigma = forecast.std(dim=1)
+            sigma_coef = parameters[..., 2] + 1.0
 
         log_forecast_sigma = torch.log(forecast_sigma + 1e-6)
 
         mu_coef = parameters[..., 0] + 1.0
         mu_base = parameters[..., 1]
-        sigma_coef = parameters[..., 2] + 1.0
         sigma_base = parameters[..., 3]
+
+        mu = mu_coef * forecast_mu + mu_base
+        log_sigma = sigma_coef * log_forecast_sigma + sigma_base
+
+        sigma = torch.exp(log_sigma)
+        sigma = torch.clamp(sigma, min=1e-6)
+
+        return NormalDistribution(mu, sigma)
+
+
+class EMOSWithSTDMapping(PP2023_DistributionMapping):
+    def __init__(self, predict_wind=True):
+        # For this mapping, predict wind has no effect.
+        self.predict_wind = predict_wind
+
+    def make_distribution(self, forecast, parameters, std_prior=None):
+        forecast_mu = forecast.mean(dim=1)
+
+        forecast_sigma = torch.nan_to_num(std_prior, nan=0.5)
+
+        log_forecast_sigma = torch.log(forecast_sigma + 1e-6)
+
+        mu_coef = parameters[..., 0] + 1.0
+        mu_base = parameters[..., 1]
+        sigma_coef = parameters[..., 2] + 0.5
+        sigma_base = parameters[..., 3] + 0.5
 
         mu = mu_coef * forecast_mu + mu_base
         log_sigma = sigma_coef * log_forecast_sigma + sigma_base

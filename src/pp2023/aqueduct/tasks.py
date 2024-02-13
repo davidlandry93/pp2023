@@ -98,14 +98,18 @@ def predict(run_id, mlflow_tracking_uri=None, test_set=False, overrides=None):
     cfg, module = get_model_from_id(mlflow_run, overrides=overrides)
 
     datamodule = FromConfigDataModule(cfg)
+    datamodule.setup()
 
     trainer = pl.Trainer(
         accelerator="auto",
     )
 
-    predictions = trainer.predict(
-        module, datamodule=datamodule, return_predictions=True
-    )
+    if test_set:
+        dataset = datamodule.test_dataloader()
+    else:
+        dataset = datamodule.val_dataloader()
+
+    predictions = trainer.predict(module, dataset, return_predictions=True)
 
     to_return = {}
     for k in predictions[0]:
@@ -951,7 +955,7 @@ class TableCRPS(aq.Task):
 
     def requirements(self):
         client = mlflow.client.MlflowClient()
-        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_07")
+        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_08")
         experiment_linear = client.get_experiment_by_name("pp2023_linear_table_06")
         all_runs = [
             r.info.run_id
@@ -1354,7 +1358,9 @@ class StepCondition(aq.Task):
         #     "pp2023_condition_mlp_step_partition_03"
         # )
 
-        partition_experiment = client.get_experiment_by_name("mlp_seq_07")
+        partition_experiment = client.get_experiment_by_name(
+            "pp2023_mlp_step_partition_09"
+        )
 
         partition_runs = client.search_runs(
             experiment_ids=[
@@ -1368,7 +1374,9 @@ class StepCondition(aq.Task):
         # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_step_condition_06")
         # mlp_experiment = client.get_experiment_by_name("pp2023_condition_mlp_step_05")
         # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_other_condition")
-        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_step_condition_08")
+        mlp_experiment = client.get_experiment_by_name(
+            "pp2023_mlp_step_other_condition_08"
+        )
         mlp_runs = client.search_runs(
             experiment_ids=[mlp_experiment.experiment_id], max_results=5000
         )
@@ -1600,12 +1608,12 @@ class CalibrationPlots(aq.Task):
     def requirements(self):
         return [
             CalibrationPlotNormal(variant="naive"),  # Naive baseline.
-            CalibrationPlot("dea1011e2c784c5691ccdc9840ab87cb"),  # MLP Bernstein
-            CalibrationPlot("d9bb5a619c0f491ba0a8d7b225155da7"),  # MLP Quantile
-            CalibrationPlotNormal("0b19b63372d34e8dab1be9a3cd06dc1d"),  # MLP Normal
+            CalibrationPlot("5d57a4ba49da45f59a7c6dfaf589eec5"),  # MLP Bernstein
+            CalibrationPlot("4cf354ce650640d28fe97a0d5662e496"),  # MLP Quantile
+            CalibrationPlotNormal("d8e4cb3169f2457d929631d34527c280"),  # MLP Normal
             CalibrationPlot("035f895777c34dd0829f970111f5059f"),  # Linear Bernstein
             CalibrationPlot("c0df917b1cb9436b9844b8220f91c2f1"),  # Linear Quantile
-            CalibrationPlotNormal("da92ed0357c94567bb2557cd8164f445"),  # Linear Normal
+            CalibrationPlotNormal("71b7c78925ab4da09061c9adf2ee72b0"),  # Linear Normal
         ]
 
     def run(self, requirements) -> pd.DataFrame:
