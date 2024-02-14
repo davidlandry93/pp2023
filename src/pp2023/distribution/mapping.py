@@ -77,8 +77,8 @@ class EMOSMapping(PP2023_DistributionMapping):
         forecast_mu = forecast.mean(dim=1)
 
         if forecast.shape[1] == 1 and not self.use_std_prior:
-            forecast_sigma = torch.full_like(forecast_mu, 1.0)
-            sigma_coef = 0
+            forecast_sigma = torch.full_like(forecast_mu, 0.0)
+            sigma_coef = torch.tensor([0.0], device=forecast.device)
         elif forecast.shape[1] == 1 and self.use_std_prior:
             forecast_sigma = torch.nan_to_num(std_prior, nan=0.5)
             sigma_coef = parameters[..., 2] + 1.0
@@ -99,62 +99,6 @@ class EMOSMapping(PP2023_DistributionMapping):
         sigma = torch.clamp(sigma, min=1e-6)
 
         return NormalDistribution(mu, sigma)
-
-
-class EMOSWithSTDMapping(PP2023_DistributionMapping):
-    def __init__(self, predict_wind=True):
-        # For this mapping, predict wind has no effect.
-        self.predict_wind = predict_wind
-
-    def make_distribution(self, forecast, parameters, std_prior=None):
-        forecast_mu = forecast.mean(dim=1)
-
-        forecast_sigma = torch.nan_to_num(std_prior, nan=0.5)
-
-        log_forecast_sigma = torch.log(forecast_sigma + 1e-6)
-
-        mu_coef = parameters[..., 0] + 1.0
-        mu_base = parameters[..., 1]
-        sigma_coef = parameters[..., 2] + 0.5
-        sigma_base = parameters[..., 3] + 0.5
-
-        mu = mu_coef * forecast_mu + mu_base
-        log_sigma = sigma_coef * log_forecast_sigma + sigma_base
-
-        sigma = torch.exp(log_sigma)
-        sigma = torch.clamp(sigma, min=1e-6)
-
-        return NormalDistribution(mu, sigma)
-
-
-class ConstructiveQuantileMapping(PP2023_DistributionMapping):
-    def __init__(self, n_quantiles):
-        self.initial = math.log(n_quantiles)
-
-    def make_distribution(
-        self, forecast: torch.Tensor, parameters: torch.Tensor, std_prior=None
-    ) -> QuantileDistribution:
-        forecast_mean = forecast.mean(dim=1).unsqueeze(-1)
-
-        midpoint = parameters.shape[-1] // 2
-
-        mid_value = parameters[..., [midpoint]] + forecast_mean
-
-        log_left_deltas = parameters[..., :midpoint]
-        left_deltas = torch.exp(log_left_deltas - self.initial)
-        left_quantiles = mid_value - (
-            torch.flip(
-                torch.cumsum(torch.flip(left_deltas, dims=(-1,)), dim=-1), dims=(-1,)
-            )
-        )
-
-        log_right_deltas = parameters[..., midpoint + 1 :]
-        right_deltas = torch.exp(log_right_deltas)
-
-        right_quantiles = mid_value + torch.cumsum(right_deltas, dim=-1)
-        quantiles = torch.cat([left_quantiles, mid_value, right_quantiles], dim=-1)
-
-        return QuantileDistribution(quantiles)
 
 
 class NaiveQuantileMapping(PP2023_DistributionMapping):

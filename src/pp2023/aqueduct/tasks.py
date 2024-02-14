@@ -1229,7 +1229,7 @@ class SpreadErrorRatio(aq.Task):
     def requirements(self):
         client = mlflow.client.MlflowClient()
         linear_experiment = client.get_experiment_by_name("pp2023_linear_table_06")
-        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_table_05")
+        mlp_experiment = client.get_experiment_by_name("pp2023_mlp_table_08")
 
         runs = client.search_runs(
             experiment_ids=[
@@ -1610,10 +1610,10 @@ class CalibrationPlots(aq.Task):
             CalibrationPlotNormal(variant="naive"),  # Naive baseline.
             CalibrationPlot("5d57a4ba49da45f59a7c6dfaf589eec5"),  # MLP Bernstein
             CalibrationPlot("4cf354ce650640d28fe97a0d5662e496"),  # MLP Quantile
-            CalibrationPlotNormal("d8e4cb3169f2457d929631d34527c280"),  # MLP Normal
+            CalibrationPlotNormal("979702f36f6a4c1da97ae09a3d3818c1"),  # MLP Normal
             CalibrationPlot("035f895777c34dd0829f970111f5059f"),  # Linear Bernstein
             CalibrationPlot("c0df917b1cb9436b9844b8220f91c2f1"),  # Linear Quantile
-            CalibrationPlotNormal("71b7c78925ab4da09061c9adf2ee72b0"),  # Linear Normal
+            CalibrationPlotNormal("956865464c5f4609bb09a89b8e2d7568"),  # Linear Normal
         ]
 
     def run(self, requirements) -> pd.DataFrame:
