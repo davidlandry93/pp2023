@@ -23,6 +23,7 @@ optimizer:
 distribution:
   mapping:
     predict_wind: False   
+    use_std_prior: True
 
 
 model:

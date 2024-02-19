@@ -157,7 +157,12 @@ class BernsteinQuantileFunctionMapping(PP2023_DistributionMapping):
     N_SAMPLES = 98  # 98 quantiles = 99 bins --> dividable by 3.
 
     def __init__(
-        self, n_parameters: int, use_base=True, predict_wind=True, loss="crps"
+        self,
+        n_parameters: int,
+        use_base=True,
+        predict_wind=True,
+        loss="crps",
+        use_std_prior=False,
     ):
         self.degree = n_parameters - 1
         self.use_base = use_base

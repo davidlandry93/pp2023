@@ -40,6 +40,7 @@ class MLP(nn.Module):
         use_forecast_time_feature=False,
         use_model_version_feature=False,
         use_std_prior=False,
+        use_moments=False,
     ):
         super().__init__()
 
@@ -50,6 +51,8 @@ class MLP(nn.Module):
             self.n_embeddings += 1
         if use_forecast_embedding:
             self.n_embeddings += 1
+
+        self.use_moments = use_moments
 
         self.n_variables = n_variables
         self.n_parameters = n_parameters
@@ -81,6 +84,9 @@ class MLP(nn.Module):
 
         if self.use_model_version_feature:
             in_features += 1
+
+        if use_moments and n_members > 1:
+            in_features *= 2
 
         feature_embedding_size = self.feature_embedding_size(
             embedding_size, self.n_embeddings
@@ -195,6 +201,12 @@ class MLP(nn.Module):
                 (*features.shape[:-1], 1),
             )
             features = torch.cat([features, model_version_feature], dim=-1)
+
+        if self.use_moments and n_members > 1:
+            features = torch.cat(
+                [features.mean(dim=1, keepdim=True), features.std(dim=1, keepdim=True)],
+                dim=-1,
+            )
 
         projected_features = self.projection(features)
         pooled_features = projected_features.mean(dim=1)
