@@ -720,24 +720,46 @@ def crps_gaussian_np(Q, y):
     return crps
 
 
-def requirements_for_run_metrics(run_id, test_set=True):
+def task_of_run_id(run_id, test_set=True):
     mlflow_run = get_run_object(run_id)
 
     if mlflow_run.data.params["dataset_name"].startswith("gdps"):
-        model_prediction_task = SMC01_ModelPredictions(run_id=run_id, test_set=test_set)
+        model_prediction_task = aq.as_artifact(
+            SMC01_ModelPredictions(run_id=run_id, test_set=test_set)
+        )
+    elif mlflow_run.data.params["dataset_name"].startswith("ens10"):
+        model_prediction_task = aq.as_artifact(
+            ModelPredictions(
+                run_id=run_id,
+                station_set="ens10_stations_smc.csv",
+                test_set=test_set,
+            )
+        )
+    else:
+        raise RuntimeError()
+
+    return model_prediction_task
+
+
+def requirements_for_run_metrics(run_id, test_set=True):
+    mlflow_run = get_run_object(run_id)
+
+    model_prediction_task = task_of_run_id(run_id, test_set=test_set)
+
+    if mlflow_run.data.params["dataset_name"].startswith("gdps"):
         obs_task = SMC01_ValTestObs()
         outlier_mask = SMC01_QualityControlMask()
+        baseline_metrics = NWPModelMetrics(dataset="gdps", test_set=test_set, variant='naive')
 
-        requirements = [model_prediction_task, obs_task, outlier_mask]
+        requirements = [model_prediction_task, obs_task, outlier_mask, baseline_metrics]
 
     elif mlflow_run.data.params["dataset_name"].startswith("ens10"):
-        model_prediction_task = ModelPredictions(
-            run_id=run_id,
-            station_set="ens10_stations_smc.csv",
-            test_set=test_set,
-        )
         obs_task = ValTestObs(station_set="ens10_stations_smc.csv")
-        requirements = [model_prediction_task, obs_task]
+        baseline_metrics = NWPModelMetrics(dataset="ens10", test_set=test_set, variant='naive')
+        requirements = [model_prediction_task, obs_task, baseline_metrics]
+    
+    else:
+        raise KeyError("Did not recognize dataset name in MLFlow run.")
 
     return requirements
 
@@ -783,7 +805,7 @@ def crps_of_prediction(prediction: xr.DataArray, observation: xr.DataArray):
 
 
 def compute_model_metrics(
-    preds: xr.Dataset, obs: xr.Dataset, qc_mask: xr.Dataset = None
+    preds: xr.Dataset, obs: xr.Dataset, baseline = None, qc_mask: xr.Dataset = None, 
 ) -> xr.Dataset:
     distribution = preds.coords["distribution"]
     dataset = preds.coords["dataset"]
@@ -834,6 +856,9 @@ def compute_model_metrics(
 
     metrics_dataset = xr.Dataset(dataset_dict)
 
+    if baseline is not None:
+        metrics_dataset['crpss'] = 1.0  - (metrics_dataset['crps'] / baseline['crps'])
+
     valid_time = metrics_dataset.forecast_time + metrics_dataset.step
 
     if qc_mask is not None:
@@ -875,13 +900,88 @@ def compute_composite_spread(Q):
     return full_metric
 
 
-class ModelMetrics(aq.Task):
-    def __init__(self, run_id: str, test_set: bool = True):
+class ModelPredictionsDispatch(aq.Task):
+    def __init__(
+        self,
+        type,
+        dataset,
+        run_id=None,
+        nwp_variant=None,
+        experiment_name=None,
+        distribution=None,
+        test_set=True,
+    ):
+        self.type = type
         self.run_id = run_id
+        self.nwp_variant = nwp_variant
+        self.dataset = dataset
+        self.test_set = test_set
+        self.experiment_name = experiment_name
+        self.distribution = distribution
+
+    def requirements(self):
+        if self.type == "mlflow":
+            return task_of_run_id(self.run_id, test_set=self.test_set)
+        elif self.type == "nwp":
+            return aq.as_artifact(
+                NWPModelPredictionsDispatch(
+                    dataset=self.nwp_dataset,
+                    test_set=self.test_set,
+                    variant=self.nwp_variant,
+                )
+            )
+        elif self.type == "ensemble":
+            return aq.as_artifact(
+                ModelPredictionsEnsemble(
+                    experiment_name=self.experiment_name,
+                    distribution=self.distribution,
+                    n_runs=5,
+                    test_set=self.test_set,
+                )
+            )
+        else:
+            raise KeyError()
+
+    def run(self, requirements):
+        return xr.open_dataset(requirements.path)
+
+
+class ModelMetricsDispatch(aq.Task):
+    def __init__(
+        self,
+        type,
+        dataset="gdps",
+        run_id=None,
+        nwp_variant="naive",
+        experiment_name="pp2023_mlp_table_08",
+        distribution=None,
+        test_set=True,
+    ):
+        self.type = type
+        self.run_id = run_id
+        self.nwp_variant = nwp_variant
+        self.dataset = dataset
+        self.experiment_name = experiment_name
+        self.distribution = distribution
         self.test_set = test_set
 
     def requirements(self):
-        return requirements_for_run_metrics(self.run_id, self.test_set)
+        preds = ModelPredictionsDispatch(
+            self.type,
+            self.dataset,
+            self.run_id,
+            self.nwp_variant,
+            self.experiment_name,
+            self.distribution,
+            self.test_set,
+        )
+
+        if self.dataset == "gdps":
+            return [preds, SMC01_ValTestObs(), SMC01_QualityControlMask()]
+        elif self.dataset == "ens10":
+            return [preds, ValTestObs(station_set="ens10_stations_smc.csv")]
+        else:
+            raise KeyError()
 
     def run(self, requirements) -> xr.Dataset:
         if len(requirements) == 3:
@@ -896,6 +996,45 @@ class ModelMetrics(aq.Task):
         obs = xr.open_dataset(obs_artifact.path)
 
         metrics = compute_model_metrics(preds, obs, qc_mask)
+
+        return metrics
+
+    def artifact(self):
+        set_label = "test" if self.test_set else "val"
+
+        if self.type == "mlflow":
+            label = f"{self.run_id}_{set_label}.nc"
+        elif self.type == "nwp":
+            label = f"{self.dataset}_{self.nwp_variant}_{set_label}.nc"
+        elif self.type == "ensemble":
+            label = f"{self.experiment_name}_{self.distribution}_{set_label}.nc"
+
+        return aq.LocalStoreArtifact(f"pp2023/metrics/{self.type}/{label}.nc")
+
+
+class ModelMetrics(aq.Task):
+    def __init__(self, run_id: str, test_set: bool = True):
+        self.run_id = run_id
+        self.test_set = test_set
+
+    def requirements(self):
+        return requirements_for_run_metrics(self.run_id, self.test_set)
+
+    def run(self, requirements) -> xr.Dataset:
+        if len(requirements) == 4:
+            preds, obs_artifact, qc_mask, baseline_metrics = requirements
+        else:
+            preds, obs_artifact, baseline_metrics = requirements
+            qc_mask = None
+
+        preds = xr.open_dataset(preds.path)
+
+        obs_artifact = (
+            obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
+        )
+        obs = xr.open_dataset(obs_artifact.path)
+
+        metrics = compute_model_metrics(preds, obs, baseline_metrics, qc_mask=qc_mask)
 
         return metrics
 
@@ -933,7 +1072,7 @@ class NWPModelMetrics(aq.Task):
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        return compute_model_metrics(preds, obs, qc_mask=qc_mask).assign_coords(
+        return compute_model_metrics(preds, obs, baseline=None, qc_mask=qc_mask).assign_coords(
             model=self.variant
         )
 
@@ -1164,10 +1303,11 @@ class ModelSpreadErrorRatio(aq.Task):
         )
 
     def run(self, requirements: tuple[xr.Dataset, Any]):
-        preds, obs_artifact, qc_mask = requirements
+        preds_artifact, obs_artifact, qc_mask = requirements
         obs_artifact = (
             obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
         )
+        preds = xr.open_dataset(preds_artifact.path)
         obs = xr.open_dataset(obs_artifact.path).sel(step=preds.step)
 
         qc_mask = qc_mask.to_array().squeeze().drop("variable")
@@ -1901,6 +2041,56 @@ class SpatialCRPS(aq.Task):
         )
 
         return df
+
+
+def sort_mean(q):
+    return np.sort(q, axis=-1)
+
+
+class ModelPredictionsEnsemble(aq.IOTask):
+    def __init__(self, experiment_name, distribution, n_runs=5, test_set=True):
+        self.experiment_name = experiment_name
+        self.distribution = distribution
+        self.n_runs = n_runs
+        self.test_set = test_set
+
+    def requirements(self):
+        client = mlflow.client.MlflowClient()
+        experiment = client.get_experiment_by_name(self.experiment_name)
+        runs = client.search_runs(
+            experiment_ids=[experiment.experiment_id], max_results=5000
+        )
+
+        run_ids = sorted(
+            [
+                r.info.run_id
+                for r in runs
+                if r.data.params["distribution_name"] == self.distribution
+            ]
+        )
+        run_ids = run_ids[: self.n_runs]
+
+        return [task_of_run_id(run_id=i, test_set=self.test_set) for i in run_ids]
+
+    def run(self, reqs):
+        all_preds = xr.open_mfdataset(
+            [r.path for r in reqs], combine="nested", concat_dim="run_id"
+        )
+
+        if all_preds.distribution.item() in ["bernstein", "quantile"]:
+            all_preds = xr.apply_ufunc(
+                sort_mean,
+                all_preds,
+                dask="allowed",
+            )
+
+        all_preds.mean(dim="run_id").to_netcdf(self.artifact().path)
+
+    def artifact(self):
+        set_label = "test" if self.test_set else "val"
+        return aq.LocalStoreArtifact(
+            f"pp2023/predictions/ensemble/{self.experiment_name}_{self.distribution}_{set_label}.nc"
+        )
 
 
 class AllFigures(aq.Task):
