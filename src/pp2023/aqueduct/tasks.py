@@ -556,6 +556,11 @@ class NaiveNWPModelPredictions(aq.Task):
 
         return xr.Dataset({"t2m": naive_forecast}).assign_coords(model="naive")
 
+    def artifact(self):
+        set_name = "test" if self.test_set else "val"
+
+        return aq.LocalStoreArtifact(f"pp2023/predictions/nwp/naive_{set_name}.nc")
+
 
 class MonthlyClimatologyModel(aq.Task):
     def __init__(self, test_set=True):
@@ -749,15 +754,19 @@ def requirements_for_run_metrics(run_id, test_set=True):
     if mlflow_run.data.params["dataset_name"].startswith("gdps"):
         obs_task = SMC01_ValTestObs()
         outlier_mask = SMC01_QualityControlMask()
-        baseline_metrics = NWPModelMetrics(dataset="gdps", test_set=test_set, variant='naive')
+        baseline_metrics = NWPModelMetrics(
+            dataset="gdps", test_set=test_set, variant="naive"
+        )
 
         requirements = [model_prediction_task, obs_task, outlier_mask, baseline_metrics]
 
     elif mlflow_run.data.params["dataset_name"].startswith("ens10"):
         obs_task = ValTestObs(station_set="ens10_stations_smc.csv")
-        baseline_metrics = NWPModelMetrics(dataset="ens10", test_set=test_set, variant='naive')
+        baseline_metrics = NWPModelMetrics(
+            dataset="ens10", test_set=test_set, variant="naive"
+        )
         requirements = [model_prediction_task, obs_task, baseline_metrics]
-    
+
     else:
         raise KeyError("Did not recognize dataset name in MLFlow run.")
 
@@ -804,8 +813,56 @@ def crps_of_prediction(prediction: xr.DataArray, observation: xr.DataArray):
     return crps_xr, mse_xr, mae_xr, bias_xr
 
 
+def quantile_values_normal(
+    params: xr.DataArray, quantile_levels: list[float]
+) -> xr.DataArray:
+    loc = params.sel(parameter="loc")
+    scale = params.sel(parameter="scale")
+
+    dist = torch.distributions.Normal(
+        torch.from_numpy(loc.fillna(0.0).values).unsqueeze(-1),
+        torch.from_numpy(scale.fillna(1.0).values).unsqueeze(-1) + 1e-6,
+        validate_args=None,
+    )
+
+    all_thresholds = dist.icdf(torch.tensor(quantile_levels))
+    all_thresholds_numpy = all_thresholds.numpy()
+    all_thresholds_numpy[np.isnan(loc)] = np.nan
+
+    thresholds_xr = xr.DataArray(
+        all_thresholds_numpy,
+        dims=[*loc.dims, "quantile_level"],
+        coords={**loc.coords, "quantile_level": quantile_levels},
+    )
+
+    return thresholds_xr.drop("parameter")
+
+
+def interpolate_quantile_values(q, quantile_levels):
+    if "quantile_level" not in q.coords:
+        n_quantiles = q.sizes["parameter"]
+        q = q.assign_coords(
+            parameter=np.array(range(1, n_quantiles + 1)) / (n_quantiles + 1)
+        ).rename({"parameter": "quantile_level"})
+
+    return q.interp(quantile_level=quantile_levels, method="linear")
+
+
+def compute_quantile_score(quantile_values, obs):
+    quantile_score = xr.where(
+        quantile_values <= obs,
+        quantile_values.quantile_level * (obs - quantile_values),
+        (1.0 - quantile_values.quantile_level) * (quantile_values - obs),
+    )
+
+    return quantile_score
+
+
 def compute_model_metrics(
-    preds: xr.Dataset, obs: xr.Dataset, baseline = None, qc_mask: xr.Dataset = None, 
+    preds: xr.Dataset,
+    obs: xr.Dataset,
+    baseline=None,
+    qc_mask: xr.Dataset = None,
 ) -> xr.Dataset:
     distribution = preds.coords["distribution"]
     dataset = preds.coords["dataset"]
@@ -823,17 +880,14 @@ def compute_model_metrics(
         bias = (preds.sel(parameter="loc") - obs).drop_vars("parameter")
         spread = (preds.sel(parameter="scale")).drop_vars("parameter")
 
-        dataset_dict = {
-            "crps": crps,
-            "mse": mse,
-            "bias": bias,
-            "mae": mae,
-            "spread": spread,
-        }
-    elif distribution in ["bernstein", "quantile"]:
-        crps, mse, mae, bias = crps_of_prediction(preds, obs)
-        n = preds.sizes["parameter"]
-        spread = np.sqrt(n / (n - 1)) * preds.std(dim="parameter")
+        quantile_values = quantile_values_normal(preds, [0.05, 0.1, 0.9, 0.95])
+        quantile_score = compute_quantile_score(quantile_values, obs)
+        quantile_score_05 = quantile_score.sel(quantile_level=0.05)
+        quantile_score_95 = quantile_score.sel(quantile_level=0.95)
+
+        quantile_spread = quantile_values.sel(quantile_level=0.9) - quantile_values.sel(
+            quantile_level=0.1
+        )
 
         dataset_dict = {
             "crps": crps,
@@ -841,7 +895,35 @@ def compute_model_metrics(
             "bias": bias,
             "mae": mae,
             "spread": spread,
-            "composite_spread": compute_composite_spread(preds),
+            "quantile_score_05": quantile_score_05.drop("quantile_level"),
+            "quantile_score_95": quantile_score_95.drop("quantile_level"),
+            "quantile_spread": quantile_spread,
+            "composite_spread": quantile_spread,
+        }
+    elif distribution in ["bernstein", "quantile"]:
+        crps, mse, mae, bias = crps_of_prediction(preds, obs)
+        n = preds.sizes["parameter"]
+        spread = np.sqrt(n / (n - 1)) * preds.std(dim="parameter")
+
+        quantile_values = interpolate_quantile_values(preds, [0.05, 0.1, 0.9, 0.95])
+        quantile_score = compute_quantile_score(quantile_values, obs)
+        quantile_score_05 = quantile_score.sel(quantile_level=0.05)
+        quantile_score_95 = quantile_score.sel(quantile_level=0.95)
+
+        quantile_spread = quantile_values.sel(
+            quantile_level=0.95
+        ) - quantile_values.sel(quantile_level=0.05)
+
+        dataset_dict = {
+            "crps": crps,
+            "mse": mse,
+            "bias": bias,
+            "mae": mae,
+            "spread": spread,
+            "composite_spread": compute_composite_spread(preds, width=0.8),
+            "quantile_spread": quantile_spread,
+            "quantile_score_05": quantile_score_05.drop("quantile_level"),
+            "quantile_score_95": quantile_score_95.drop("quantile_level"),
         }
     elif distribution == "deterministic":
         crps = np.abs(preds - obs).squeeze()
@@ -854,10 +936,23 @@ def compute_model_metrics(
     else:
         raise KeyError("Could not compute crps for distribution type.")
 
-    metrics_dataset = xr.Dataset(dataset_dict)
+    metrics_dataset = xr.Dataset(
+        {
+            k: v.drop_vars(["elevation", "latitude", "longitude"], errors="ignore")
+            for k, v in dataset_dict.items()
+        }
+    )
+
+    metrics_dataset.assign_coords(
+        {
+            "elevation": obs.elevation,
+            "latitude": obs.latitude,
+            "longitude": obs.longitude,
+        }
+    )
 
     if baseline is not None:
-        metrics_dataset['crpss'] = 1.0  - (metrics_dataset['crps'] / baseline['crps'])
+        metrics_dataset["crpss"] = 1.0 - (metrics_dataset["crps"] / baseline["crps"])
 
     valid_time = metrics_dataset.forecast_time + metrics_dataset.step
 
@@ -879,7 +974,7 @@ def compute_model_metrics(
     return metrics_dataset
 
 
-def compute_composite_spread(Q):
+def compute_composite_spread(Q, width=0.9):
     sorted_q = Q.isel(parameter=Q.argsort(axis=-1))
     bin_width = sorted_q.isel(parameter=slice(1, None)) - sorted_q.isel(
         parameter=slice(0, -1)
@@ -887,11 +982,11 @@ def compute_composite_spread(Q):
     sorted_width = bin_width.isel(parameter=bin_width.argsort(axis=-1))
 
     n_bins = bin_width.shape[-1]
-    n_for_metric = math.floor(n_bins * 0.683)
+    n_for_metric = math.floor(n_bins * width)
 
     base_metric = sorted_width[..., :n_for_metric].sum(axis=-1)
 
-    leftover_cdf = 0.683 - (n_for_metric / n_bins)
+    leftover_cdf = width - (n_for_metric / n_bins)
     last_column_ratio = leftover_cdf / (1 / n_bins)
     last_column_value = sorted_width[..., n_for_metric] * last_column_ratio
 
@@ -925,7 +1020,7 @@ class ModelPredictionsDispatch(aq.Task):
         elif self.type == "nwp":
             return aq.as_artifact(
                 NWPModelPredictionsDispatch(
-                    dataset=self.nwp_dataset,
+                    dataset=self.dataset,
                     test_set=self.test_set,
                     variant=self.nwp_variant,
                 )
@@ -995,7 +1090,7 @@ class ModelMetricsDispatch(aq.Task):
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        metrics = compute_model_metrics(preds, obs, qc_mask)
+        metrics = compute_model_metrics(preds, obs, qc_mask=qc_mask)
 
         return metrics
 
@@ -1008,6 +1103,8 @@ class ModelMetricsDispatch(aq.Task):
             label = f"{self.dataset}_{self.nwp_variant}_{set_label}.nc"
         elif self.type == "ensemble":
             label = f"{self.experiment_name}_{self.distribution}_{set_label}.nc"
+        else:
+            raise KeyError()
 
         return aq.LocalStoreArtifact(f"pp2023/metrics/{self.type}/{label}.nc")
 
@@ -1072,9 +1169,9 @@ class NWPModelMetrics(aq.Task):
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        return compute_model_metrics(preds, obs, baseline=None, qc_mask=qc_mask).assign_coords(
-            model=self.variant
-        )
+        return compute_model_metrics(
+            preds, obs, baseline=None, qc_mask=qc_mask
+        ).assign_coords(model=self.variant)
 
     def artifact(self):
         model_label = self.variant
@@ -1093,56 +1190,78 @@ class TableCRPS(aq.Task):
         pass
 
     def requirements(self):
-        client = mlflow.client.MlflowClient()
-        experiment_mlp = client.get_experiment_by_name("pp2023_mlp_table_08")
-        experiment_linear = client.get_experiment_by_name("pp2023_linear_table_06")
-        all_runs = [
-            r.info.run_id
-            for r in client.search_runs(
-                experiment_ids=[
-                    experiment_mlp.experiment_id,
-                    experiment_linear.experiment_id,
-                ],
-                max_results=5000,
-            )
-        ]
+        model_tasks = []
+        for experiment_name in ["pp2023_mlp_table_08"]:
+            for distribution in ["deterministic", "quantile", "bernstein", "emos"]:
+                model_tasks.append(
+                    ModelMetricsDispatch(
+                        type="ensemble",
+                        experiment_name=experiment_name,
+                        distribution=distribution,
+                        test_set=True,
+                    )
+                )
 
-        runs_tasks = [ModelMetrics(run_id=run_id, test_set=True) for run_id in all_runs]
+        model_tasks.extend(
+            [
+                ModelMetrics(
+                    run_id="e9ef58e43d584ab9bdc1f00067533123", test_set=True
+                ),  # EMOS.
+                ModelMetrics(
+                    run_id="b00adfeb13bf4944a86af9d20d76a789", test_set=True
+                ),  # LBQ.
+                ModelMetrics(
+                    run_id="899a9e1b93bd4978b10203022fcf277e", test_set=True
+                ),  # LQR.
+                ModelMetrics(
+                    run_id="383d53fda0e0427882958c033e3dc3bc", test_set=True
+                ),  # Deterministic.
+            ]
+        )
 
         for dataset in ["gdps"]:
-            runs_tasks.append(
+            model_tasks.append(
                 NWPModelMetrics(dataset=dataset, test_set=True, variant="raw")
             )
-            runs_tasks.append(
+            model_tasks.append(
                 NWPModelMetrics(dataset=dataset, test_set=True, variant="debiased")
             )
-            runs_tasks.append(
+            model_tasks.append(
                 NWPModelMetrics(dataset=dataset, test_set=True, variant="naive")
             )
 
-        return runs_tasks
+        return model_tasks
 
     def run(self, requirements: list[xr.Dataset]):
         rows = []
         for full_metrics in requirements:
-            for lead in ["first_two", "all"]:
+            for lead in ["all"]:
                 metrics = full_metrics.sel(step=full_metrics.step > pd.to_timedelta(0))
 
                 run_id = metrics["run_id"].item() if "run_id" in metrics else None
 
                 crps_mean = metrics.crps.mean()
                 rmse = np.sqrt(metrics.mse.mean())
-                rows.append(
-                    {
-                        "rmse": rmse.item(),
-                        "crps": crps_mean.item(),
-                        "distribution": metrics.coords["distribution"].item(),
-                        "dataset": metrics.coords["dataset"].item(),
-                        "model": metrics.coords["model"].item(),
-                        "run_id": run_id,
-                        "lead": lead,
-                    }
-                )
+
+                row_dict = {
+                    "rmse": rmse.item(),
+                    "crps": crps_mean.item(),
+                    "distribution": metrics.coords["distribution"].item(),
+                    "dataset": metrics.coords["dataset"].item(),
+                    "model": metrics.coords["model"].item(),
+                    "run_id": run_id,
+                    "lead": lead,
+                }
+
+                if "quantile_score_05" in metrics:
+                    row_dict["quantile_score_05"] = (
+                        metrics.quantile_score_05.mean().item()
+                    )
+                    row_dict["quantile_score_95"] = (
+                        metrics.quantile_score_95.mean().item()
+                    )
+
+                rows.append(row_dict)
 
         df = pd.DataFrame(rows)
         df["dataset"] = df["dataset"].replace(
@@ -1157,8 +1276,14 @@ class MetricsByStep(TableCRPS):
         dfs = []
 
         for model_metrics in requirements:
+            q_df = model_metrics.quantile(
+                [0.05, 0.95], dim=["forecast_time", "station"]
+            ).to_dataframe()
+
             df = model_metrics.mean(dim=["forecast_time", "station"]).to_dataframe()
+
             df["rmse"] = np.sqrt(df["mse"])
+
             dfs.append(df)
 
         df = pd.concat(dfs)
@@ -1285,8 +1410,10 @@ class ModelSpreadErrorRatio(aq.Task):
     def requirements(self):
         if self.nwp_variant:
             return [
-                NWPModelPredictionsDispatch(
-                    variant=self.nwp_variant, test_set=self.test_set
+                aq.as_artifact(
+                    NWPModelPredictionsDispatch(
+                        variant=self.nwp_variant, test_set=self.test_set
+                    )
                 ),
                 SMC01_ValTestObs(),
                 SMC01_QualityControlMask(),
@@ -1303,11 +1430,10 @@ class ModelSpreadErrorRatio(aq.Task):
         )
 
     def run(self, requirements: tuple[xr.Dataset, Any]):
-        preds_artifact, obs_artifact, qc_mask = requirements
+        preds, obs_artifact, qc_mask = requirements
         obs_artifact = (
             obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
         )
-        preds = xr.open_dataset(preds_artifact.path)
         obs = xr.open_dataset(obs_artifact.path).sel(step=preds.step)
 
         qc_mask = qc_mask.to_array().squeeze().drop("variable")
@@ -1355,14 +1481,85 @@ class ModelSpreadErrorRatio(aq.Task):
         else:
             raise KeyError("Could not identify distribution")
 
+        n_quantiles = preds.sizes["parameter"]
+        spread_error_ratio = np.sqrt((n_quantiles + 1) / n_quantiles) * (
+            root_mean_ensemble_variance / rmse_of_ensemble_mean
+        )
+
         dataset = xr.Dataset(
             {
                 "spread": root_mean_ensemble_variance,
                 "error": rmse_of_ensemble_mean,
+                "spread_error_ratio": spread_error_ratio,
             }
         )
 
         return dataset
+
+
+class ModelSpreadErrorRatioDispatch(ModelSpreadErrorRatio):
+    def __init__(
+        self,
+        type: str,
+        dataset="gdps",
+        run_id=None,
+        experiment_name: str = None,
+        distribution: str = None,
+        test_set: bool = True,
+        nwp_variant: str = None,
+    ):
+        self.type = type
+        self.experiment_name = experiment_name
+        self.distribution = distribution
+        self.test_set = test_set
+        self.nwp_variant = nwp_variant
+        self.run_id = run_id
+        self.dataset = dataset
+
+    def artifact(self):
+        set_label = "test" if self.test_set else "val"
+
+        if self.type == "mlflow":
+            label = f"{self.run_id}_{set_label}.nc"
+        elif self.type == "nwp":
+            label = f"{self.dataset}_{self.nwp_variant}_{set_label}.nc"
+        elif self.type == "ensemble":
+            label = f"{self.experiment_name}_{self.distribution}_{set_label}.nc"
+        else:
+            raise KeyError()
+
+        return aq.LocalStoreArtifact(
+            f"pp2023/metrics/spread_error_ratio/{self.type}/{label}.nc"
+        )
+
+    def requirements(self):
+        if self.type == "ensemble":
+            predictions_task = ModelPredictionsDispatch(
+                dataset="gdps",
+                type=self.type,
+                experiment_name=self.experiment_name,
+                distribution=self.distribution,
+                test_set=self.test_set,
+            )
+        elif self.type == "nwp":
+            predictions_task = NWPModelPredictionsDispatch(
+                dataset="gdps", variant=self.nwp_variant, test_set=self.test_set
+            )
+        elif self.type == "mlflow":
+            predictions_task = ModelPredictionsDispatch(
+                type="mlflow",
+                dataset="gdps",
+                run_id=self.run_id,
+                test_set=self.test_set,
+            )
+        else:
+            raise NotImplementedError()
+
+        return [
+            predictions_task,
+            SMC01_ValTestObs(),
+            SMC01_QualityControlMask(),
+        ]
 
 
 class SpreadErrorRatio(aq.Task):
@@ -1389,11 +1586,17 @@ class SpreadErrorRatio(aq.Task):
 
         requirements = [
             *[
-                ModelSpreadErrorRatio(run_id=run_id, test_set=True)
-                for run_id in filtered_runs
+                ModelSpreadErrorRatioDispatch(
+                    type="ensemble",
+                    experiment_name=experiment_name,
+                    distribution=distribution,
+                    test_set=True,
+                )
+                for experiment_name in ["pp2023_linear_table_06", "pp2023_mlp_table_08"]
+                for distribution in ["quantile", "emos", "bernstein"]
             ],
             *[
-                ModelSpreadErrorRatio(nwp_variant=x, test_set=True)
+                ModelSpreadErrorRatioDispatch(type="nwp", nwp_variant=x, test_set=True)
                 for x in nwp_variants
             ],
         ]
@@ -1671,7 +1874,6 @@ class CalibrationPlot(aq.Task):
 
     def run(self, requirements):
         preds, obs_artifact = requirements
-
         return self.compute_counts(preds, obs_artifact)
 
     def compute_counts(self, preds, obs_artifact):
@@ -1680,10 +1882,9 @@ class CalibrationPlot(aq.Task):
         )
         obs = xr.open_dataset(obs_artifact.path)
 
-        obs = obs.reindex({"forecast_time": preds.forecast_time, "step": preds.step})
-
         preds = preds.t2m.sel(step=preds.step > pd.to_timedelta(0, unit="d"))
         obs = obs.obs_t2m.sel(step=obs.step > pd.to_timedelta(0, unit="d"))
+        obs = obs.reindex({"forecast_time": preds.forecast_time, "step": preds.step})
 
         bin_ids = (obs < preds).sum(dim="parameter")
         bin_ids_df = bin_ids.to_dataframe("bin_id")
@@ -1711,6 +1912,33 @@ class CalibrationPlot(aq.Task):
         )
 
 
+class CalibrationPlotEnsemble(CalibrationPlot):
+    def __init__(self, experiment_name, distribution, test_set=True):
+        self.experiment_name = experiment_name
+        self.distribution = distribution
+        self.test_set = test_set
+
+    def requirements(self):
+        preds_task = ModelPredictionsEnsemble(
+            self.experiment_name, self.distribution, test_set=self.test_set
+        )
+        obs_task = SMC01_ValTestObs()
+
+        return preds_task, obs_task
+
+    def artifact(self):
+        set_label = "test" if self.test_set else "val"
+
+        return aq.LocalStoreArtifact(
+            f"pp2023/calibration_plots/ensemble_{self.experiment_name}_{self.distribution}_{set_label}.parquet"
+        )
+
+    def run(self, requirements):
+        preds_artifact, obs = requirements
+        preds = xr.open_dataset(preds_artifact.path)
+        return super().run(preds, obs)
+
+
 def pit_transform_normal(preds: np.array, n_bins: int = 33) -> np.array:
     loc = np.expand_dims(preds.sel(parameter="loc"), axis=-1)
     scale = np.expand_dims(preds.sel(parameter="scale"), axis=-1)
@@ -1726,6 +1954,42 @@ def pit_transform_normal(preds: np.array, n_bins: int = 33) -> np.array:
 
 
 class CalibrationPlotNormal(CalibrationPlot):
+    def __init__(
+        self,
+        dataset,
+        run_id=None,
+        variant=None,
+        experiment_name=None,
+        distribution=None,
+        test_set=True,
+    ):
+        self.dataset = dataset
+        self.run_id = run_id
+        self.variant = variant
+        self.experiment_name = experiment_name
+        self.distribution = distribution
+        self.test_set = test_set
+
+    def requirements(self):
+        if self.run_id:
+            return super().requirements()
+        elif self.variant:
+            return [
+                NaiveNWPModelPredictions(self.test_set),
+                SMC01_ValTestObs(),
+            ]
+        else:
+            return [
+                ModelPredictionsDispatch(
+                    type="ensemble",
+                    experiment_name=self.experiment_name,
+                    distribution=self.distribution,
+                    test_set=self.test_set,
+                    dataset="gdps",
+                ),
+                SMC01_ValTestObs(),
+            ]
+
     def run(self, requirements) -> pd.DataFrame:
         preds, obs_artifact = requirements
 
@@ -1743,17 +2007,80 @@ class CalibrationPlotNormal(CalibrationPlot):
 
         return self.compute_counts(pit_preds_dataset, obs_artifact)
 
+    def artifact(self):
+        set_label = "test" if self.test_set else "val"
+
+        if self.run_id:
+            return aq.LocalStoreArtifact(
+                f"pp2023/calibration_plots/{self.run_id}_{set_label}.parquet"
+            )
+        elif self.variant:
+            return aq.LocalStoreArtifact(
+                f"pp2023/calibration_plots/nwp_{self.variant}_{set_label}.parquet"
+            )
+        else:
+            return aq.LocalStoreArtifact(
+                f"pp2023/calibration_plots/{self.experiment_name}_{self.distribution}_{set_label}.parquet"
+            )
+
+
+class CalibrationPlotDispatch(aq.Task):
+    def __init__(
+        self,
+        type,
+        run_id=None,
+        experiment_name=None,
+        distribution=None,
+        nwp_variant=None,
+        test_set=True,
+    ):
+        self.type = type
+        self.run_id = run_id
+        self.experiment_name = experiment_name
+        self.distribution = distribution
+        self.nwp_variant = nwp_variant
+        self.test_set = test_set
+
+    def requirements(self):
+        if self.type == "ensemble":
+            return CalibrationPlotEnsemble(
+                self.experiment_name,
+                distribution=self.distribution,
+                experiment_name=self.experiment_name,
+                test_set=self.test_set,
+            )
+        elif self.type == "mlflow":
+            return CalibrationPlotNormal(self.run_id, test_set=self.test_set)
+        elif self.type == "nwp":
+            return CalibrationPlot(variant=self.nwp_variant, test_set=self.test_set)
+        else:
+            raise KeyError()
+
+    def run(self, requirements):
+        return requirements
+
 
 class CalibrationPlots(aq.Task):
     def requirements(self):
         return [
-            CalibrationPlotNormal(variant="naive"),  # Naive baseline.
-            CalibrationPlot("5d57a4ba49da45f59a7c6dfaf589eec5"),  # MLP Bernstein
-            CalibrationPlot("4cf354ce650640d28fe97a0d5662e496"),  # MLP Quantile
-            CalibrationPlotNormal("979702f36f6a4c1da97ae09a3d3818c1"),  # MLP Normal
-            CalibrationPlot("035f895777c34dd0829f970111f5059f"),  # Linear Bernstein
-            CalibrationPlot("c0df917b1cb9436b9844b8220f91c2f1"),  # Linear Quantile
-            CalibrationPlotNormal("956865464c5f4609bb09a89b8e2d7568"),  # Linear Normal
+            CalibrationPlotNormal("gdps", variant="naive"),  # Naive baseline.
+            CalibrationPlotEnsemble(
+                "pp2023_mlp_table_08", "bernstein", True
+            ),  # MLP Bernstein
+            CalibrationPlotEnsemble(
+                "pp2023_mlp_table_08", "quantile", True
+            ),  # MLP Quantile
+            CalibrationPlotNormal(
+                "gdps",
+                experiment_name="pp2023_mlp_table_08",
+                distribution="emos",
+                test_set=True,
+            ),  # MLP Normal
+            CalibrationPlot("b00adfeb13bf4944a86af9d20d76a789"),  # Linear Bernstein
+            CalibrationPlot("899a9e1b93bd4978b10203022fcf277e"),  # Linear Quantile
+            CalibrationPlotNormal(
+                "gdps", run_id="e9ef58e43d584ab9bdc1f00067533123"
+            ),  # Linear Normal
         ]
 
     def run(self, requirements) -> pd.DataFrame:
@@ -2048,7 +2375,9 @@ def sort_mean(q):
 
 
 class ModelPredictionsEnsemble(aq.IOTask):
-    def __init__(self, experiment_name, distribution, n_runs=5, test_set=True):
+    def __init__(
+        self, experiment_name, distribution, n_runs=5, test_set=True, filters={}
+    ):
         self.experiment_name = experiment_name
         self.distribution = distribution
         self.n_runs = n_runs
