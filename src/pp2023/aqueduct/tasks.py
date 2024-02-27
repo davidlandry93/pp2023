@@ -943,13 +943,13 @@ def compute_model_metrics(
         }
     )
 
-    metrics_dataset.assign_coords(
-        {
-            "elevation": obs.elevation,
-            "latitude": obs.latitude,
-            "longitude": obs.longitude,
-        }
-    )
+    # metrics_dataset.assign_coords(
+    #     {
+    #         "elevation": obs.elevation,
+    #         "latitude": obs.latitude,
+    #         "longitude": obs.longitude,
+    #     }
+    # )
 
     if baseline is not None:
         metrics_dataset["crpss"] = 1.0 - (metrics_dataset["crps"] / baseline["crps"])
@@ -1005,6 +1005,7 @@ class ModelPredictionsDispatch(aq.Task):
         experiment_name=None,
         distribution=None,
         test_set=True,
+        **kwargs,
     ):
         self.type = type
         self.run_id = run_id
@@ -1013,6 +1014,7 @@ class ModelPredictionsDispatch(aq.Task):
         self.test_set = test_set
         self.experiment_name = experiment_name
         self.distribution = distribution
+        self.kwargs = kwargs
 
     def requirements(self):
         if self.type == "mlflow":
@@ -1032,6 +1034,7 @@ class ModelPredictionsDispatch(aq.Task):
                     distribution=self.distribution,
                     n_runs=5,
                     test_set=self.test_set,
+                    **self.kwargs,
                 )
             )
         else:
@@ -1039,6 +1042,68 @@ class ModelPredictionsDispatch(aq.Task):
 
     def run(self, requirements):
         return xr.open_dataset(requirements.path)
+
+
+class EnsembleModelMetrics(aq.Task):
+    def __init__(
+        self,
+        experiment_name,
+        distribution,
+        test_set=True,
+        step_embedding=True,
+        step_feature=True,
+        step_idx=None,
+        n_members=None,
+        dataset="gdps",
+    ):
+        self.experiment_name = experiment_name
+        self.distribution = distribution
+        self.test_set = test_set
+        self.step_embedding = step_embedding
+        self.step_feature = step_feature
+        self.step_idx = step_idx
+        self.dataset = dataset
+        self.n_members = n_members
+
+    def requirements(self):
+        preds = ModelPredictionsEnsemble(
+            self.experiment_name,
+            self.distribution,
+            n_runs=5,
+            test_set=self.test_set,
+            step_embedding=self.step_embedding,
+            step_feature=self.step_feature,
+            step_idx=self.step_idx,
+            n_members=self.n_members,
+        )
+
+        if self.dataset == "gdps":
+            return [preds, SMC01_ValTestObs(), SMC01_QualityControlMask()]
+        elif self.dataset == "ens10":
+            return [preds, ValTestObs(station_set="ens10_stations_smc.csv")]
+        else:
+            raise KeyError("Unhandled dataset")
+
+    def run(self, reqs):
+        if self.dataset == "gdps":
+            preds_artifact, obs_artifact, qc_mask = reqs
+        else:
+            preds_artifact, obs_artifact = reqs
+            qc_mask = None
+
+        preds = xr.open_dataset(preds_artifact.path)
+        obs_artifact = (
+            obs_artifact.artifacts[1] if self.test_set else obs_artifact.artifacts[0]
+        )
+        obs = xr.open_dataset(obs_artifact.path)
+
+        return compute_model_metrics(preds, obs, baseline=None, qc_mask=qc_mask)
+
+    def artifact(self):
+        step_idx_label = f"_s{self.step_idx}" if self.step_idx is not None else ""
+        n_member_label = f"_m{self.n_members}" if self.n_members is not None else ""
+        label = f"{self.experiment_name}_{self.distribution}_{self.test_set}_{self.step_embedding}_{self.step_feature}{step_idx_label}{n_member_label}.nc"
+        return aq.LocalStoreArtifact(f"pp2023/metrics/ensemble/{label}.nc")
 
 
 class ModelMetricsDispatch(aq.Task):
@@ -1051,6 +1116,7 @@ class ModelMetricsDispatch(aq.Task):
         experiment_name="pp2023_mlp_table_08",
         distribution=None,
         test_set=True,
+        **kwargs,
     ):
         self.type = type
         self.run_id = run_id
@@ -1059,6 +1125,7 @@ class ModelMetricsDispatch(aq.Task):
         self.experiment_name = experiment_name
         self.distribution = distribution
         self.test_set = test_set
+        self.kwargs = kwargs
 
     def requirements(self):
         preds = ModelPredictionsDispatch(
@@ -1069,6 +1136,7 @@ class ModelMetricsDispatch(aq.Task):
             self.experiment_name,
             self.distribution,
             self.test_set,
+            **self.kwargs,
         )
 
         if self.dataset == "gdps":
@@ -1690,154 +1758,125 @@ class JointTrainingGain(aq.Task):
         return pd.concat(dfs)
 
 
+def strategy_of_run(run_xr):
+    conditioning_config = (
+        run_xr.step_embedding.item(),
+        run_xr.step_feature.item(),
+    )
+
+    if conditioning_config == ("True", "True"):
+        return "both"
+    elif conditioning_config == ("True", "False"):
+        return "embedding"
+    elif conditioning_config == ("False", "True"):
+        return "feature"
+    elif conditioning_config == ("False", "False"):
+        return "none"
+    else:
+        raise RuntimeError("Unknown conditioning config")
+
+
 class StepCondition(aq.Task):
     def requirements(self):
-        client = mlflow.client.MlflowClient()
-        # partition_experiment = client.get_experiment_by_name(
-        #     "pp2023_mlp_step_condition_partition_06"
-        # )
+        full_runs = []
+        partition_runs = []
+        for distribution in ["quantile", "emos", "bernstein"]:
+            for use_step_embedding in [True, False]:
+                for use_step_feature in [True, False]:
+                    full_runs.append(
+                        EnsembleModelMetrics(
+                            experiment_name="pp2023_mlp_step_other_condition_08",
+                            distribution=distribution,
+                            test_set=True,
+                            step_embedding=use_step_embedding,
+                            step_feature=use_step_feature,
+                        )
+                    )
 
-        # partition_experiment = client.get_experiment_by_name(
-        #     "pp2023_condition_mlp_step_partition_03"
-        # )
+            partitioned_runs_of_distribution = []
+            for step in range(1, 11):
+                partitioned_runs_of_distribution.append(
+                    EnsembleModelMetrics(
+                        experiment_name="pp2023_mlp_step_partition_09",
+                        distribution=distribution,
+                        test_set=True,
+                        step_idx=step,
+                        step_embedding=False,
+                        step_feature=False,
+                    )
+                )
+            partition_runs.append(partitioned_runs_of_distribution)
 
-        partition_experiment = client.get_experiment_by_name(
-            "pp2023_mlp_step_partition_09"
-        )
-
-        partition_runs = client.search_runs(
-            experiment_ids=[
-                partition_experiment.experiment_id,
-            ],
-            max_results=5000,
-        )
-
-        partition_run_ids = [r.info.run_id for r in partition_runs]
-
-        # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_step_condition_06")
-        # mlp_experiment = client.get_experiment_by_name("pp2023_condition_mlp_step_05")
-        # mlp_experiment = client.get_experiment_by_name("pp2023_mlp_other_condition")
-        mlp_experiment = client.get_experiment_by_name(
-            "pp2023_mlp_step_other_condition_08"
-        )
-        mlp_runs = client.search_runs(
-            experiment_ids=[mlp_experiment.experiment_id], max_results=5000
-        )
-        mlp_run_ids = [r.info.run_id for r in mlp_runs]
-
-        mlp_tasks = [ModelMetrics(run_id=i, test_set=True) for i in mlp_run_ids]
-
-        partition_run_tasks = [
-            ModelMetrics(run_id=i, test_set=True) for i in partition_run_ids
-        ]
-
-        return [
-            mlp_tasks,
-            *partition_run_tasks,
-        ]
+        return (full_runs, partition_runs)
 
     def run(self, requirements):
         (
             mlp_runs,
-            *partitioned_runs,
+            partitioned_runs,
         ) = requirements
 
-        dfs = []
+        partition_xr = xr.combine_nested(
+            partitioned_runs, concat_dim=["distribution", "step"]
+        ).assign_coords(strategy="partition")
 
-        for run in mlp_runs:
-            df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
-            dfs.append(df.reset_index())
+        mlp_runs_nested = []
+        for _ in ["quantile", "emos", "bernstein"]:
+            runs_of_distribution = []
+            for _ in [True, False]:
+                for _ in [True, False]:
+                    current_run = mlp_runs.pop(0)
+                    runs_of_distribution.append(
+                        current_run.assign(strategy=strategy_of_run(current_run))
+                    )
+            mlp_runs_nested.append(xr.concat(runs_of_distribution, dim="strategy"))
 
-        for run in partitioned_runs:
-            if "step" not in run.dims:
-                run = run.expand_dims("step")
-
-            df = run.mean(dim=["forecast_time", "station"]).to_dataframe()
-            count = run.count(dim=["forecast_time", "station"]).to_dataframe()
-            df["condition"] = "partitioned"
-            df["count"] = count["crps"]
-            dfs.append(df.reset_index())
-
-        df = pd.concat(dfs)
-
-        df = df.replace(
-            {
-                "gdps_prebatch_partition": "gdps_prebatch_24h",
-                "gdps_hdf_24h_onestep": "gdps_prebatch_24h",
-                "gdps_hdf_24h_no6": "gdps_prebatch_24h",
-            }
+        mlp_xr = xr.concat(mlp_runs_nested, dim="distribution").sel(
+            step=slice("1D", None)
         )
 
-        return df
+        full_xr = xr.concat([mlp_xr, partition_xr], dim="strategy")
+        full_xr = full_xr[["crps"]]
 
+        return full_xr
 
-class FactorCompareStep(aq.Task):
-    EXPERIMENT_NAME = "pp2023_condition_mlp_step"
-
-    def requirements(self):
-        client = mlflow.client.MlflowClient()
-        experiment = client.get_experiment_by_name(self.EXPERIMENT_NAME)
-
-        runs = client.search_runs(
-            experiment_ids=[experiment.experiment_id],
-            max_results=5000,
-        )
-
-        run_ids = [r.info.run_id for r in runs]
-
-        run_tasks = [ModelMetrics(run_id=i, test_set=True) for i in run_ids]
-
-        return run_tasks
-
-    def run(self, requirements):
-        dfs = []
-        for dataset in requirements:
-            dataset = dataset.sel(step=dataset.step > pd.to_timedelta(0))
-            crps_df = dataset.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
-            count = dataset.crps.count(dim=["forecast_time", "station"]).to_dataframe()
-            crps_df["count"] = count["crps"]
-
-            dfs.append(crps_df)
-
-        df = pd.concat(dfs)
-
-        df = df[
-            ~df["dataset"].str.startswith("gdps")
-            | (df.index.get_level_values("step") > pd.to_timedelta(0))
-        ]
-
-        return df
-
-
-class FactorCompareStation(FactorCompareStep):
-    EXPERIMENT_NAME = "pp2023_condition_mlp_station_02"
+    def artifact(self):
+        return aq.LocalStoreArtifact("pp2023/step_condition_crps.nc")
 
 
 class SkillWithMembers(aq.Task):
     def requirements(self):
-        client = mlflow.client.MlflowClient()
-        # partition_experiment = client.get_experiment_by_name("pp2023_add_members_02")
-        partition_experiment = client.get_experiment_by_name("pp2023_mlp_n_members")
-        partition_runs = client.search_runs(
-            experiment_ids=[partition_experiment.experiment_id], max_results=5000
-        )
+        reqs = []
+        for distribution in ["emos", "bernstein", "quantile"]:
+            metrics_of_distribution = []
+            for n in range(1, 11):
+                metrics_of_distribution.append(
+                    EnsembleModelMetrics(
+                        experiment_name="pp2023_mlp_n_members",
+                        distribution=distribution,
+                        test_set=True,
+                        n_members=n,
+                        dataset="ens10",
+                    )
+                )
+            reqs.append(metrics_of_distribution)
 
-        partition_run_ids = [r.info.run_id for r in partition_runs]
+        return reqs
 
-        partition_run_tasks = [
-            ModelMetrics(run_id=i, test_set=True) for i in partition_run_ids
-        ]
+    # def run(self, requirements):
+    #     dfs = []
 
-        return partition_run_tasks
+    #     for run in requirements:
+    #         df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
+    #         dfs.append(df)
+
+    #     return pd.concat(dfs)
 
     def run(self, requirements):
-        dfs = []
+        combined = xr.combine_nested(
+            requirements, concat_dim=["distribution", "n_members"]
+        )[["crps"]]
 
-        for run in requirements:
-            df = run.crps.mean(dim=["forecast_time", "station"]).to_dataframe()
-            dfs.append(df)
-
-        return pd.concat(dfs)
+        return combined.assign_coords(n_members=combined.n_members.astype(int))
 
 
 class CalibrationPlot(aq.Task):
@@ -2376,12 +2415,24 @@ def sort_mean(q):
 
 class ModelPredictionsEnsemble(aq.IOTask):
     def __init__(
-        self, experiment_name, distribution, n_runs=5, test_set=True, filters={}
+        self,
+        experiment_name,
+        distribution,
+        n_runs=5,
+        test_set=True,
+        step_embedding=True,
+        step_feature=True,
+        step_idx=None,
+        n_members=None,
     ):
         self.experiment_name = experiment_name
         self.distribution = distribution
         self.n_runs = n_runs
         self.test_set = test_set
+        self.step_embedding = step_embedding
+        self.step_feature = step_feature
+        self.step_idx = step_idx
+        self.n_members = n_members
 
     def requirements(self):
         client = mlflow.client.MlflowClient()
@@ -2390,13 +2441,27 @@ class ModelPredictionsEnsemble(aq.IOTask):
             experiment_ids=[experiment.experiment_id], max_results=5000
         )
 
-        run_ids = sorted(
-            [
-                r.info.run_id
-                for r in runs
-                if r.data.params["distribution_name"] == self.distribution
-            ]
-        )
+        run_ids = []
+        for r in runs:
+            if (
+                r.data.params["distribution_name"] == self.distribution
+                and r.data.params["model.use_step_embedding"]
+                == str(self.step_embedding)
+                and r.data.params["model.use_step_feature"] == str(self.step_feature)
+            ):
+                if self.step_idx is not None:
+                    if "dataset.maker.step_idx" in r.data.params and r.data.params[
+                        "dataset.maker.step_idx"
+                    ] == str(self.step_idx):
+                        run_ids.append(r.info.run_id)
+                elif self.n_members is not None:
+                    if "dataset.n_members" in r.data.params and r.data.params[
+                        "dataset.n_members"
+                    ] == str(self.n_members):
+                        run_ids.append(r.info.run_id)
+                else:
+                    run_ids.append(r.info.run_id)
+
         run_ids = run_ids[: self.n_runs]
 
         return [task_of_run_id(run_id=i, test_set=self.test_set) for i in run_ids]
@@ -2417,8 +2482,11 @@ class ModelPredictionsEnsemble(aq.IOTask):
 
     def artifact(self):
         set_label = "test" if self.test_set else "val"
+        step_idx_label = f"_{self.step_idx}" if self.step_idx else ""
+        n_member_label = f"_n{self.n_members}" if self.n_members else ""
+
         return aq.LocalStoreArtifact(
-            f"pp2023/predictions/ensemble/{self.experiment_name}_{self.distribution}_{set_label}.nc"
+            f"pp2023/predictions/ensemble/{self.experiment_name}_{self.distribution}_{set_label}_{self.step_embedding}_{self.step_feature}{step_idx_label}{n_member_label}.nc"
         )
 
 

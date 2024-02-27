@@ -110,6 +110,10 @@ def train_cli(cfg):
 
     if cfg.seed is not None:
         torch.manual_seed(cfg.seed)
+    else:
+        job_id = os.getenv("SLURM_JOB_ID", None)
+        if job_id is not None:
+            torch.manual_seed(int(job_id))
 
     mlflow.set_tracking_uri(cfg.mlflow.tracking_uri)
     if is_main_process():
